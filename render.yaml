@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: edutest-server
+    env: python
+    buildCommand: |
+      apt-get update && apt-get install -y libreoffice --no-install-recommends
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
