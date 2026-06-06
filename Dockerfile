@@ -1,8 +1,8 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y \
-    libreoffice \
-    libmagic1 \
+    libreoffice-core \
+    libreoffice-writer \
     --no-install-recommends && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
