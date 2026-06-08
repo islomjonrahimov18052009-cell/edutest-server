@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 
+# v2 - force rebuild
 RUN apt-get update && apt-get install -y \
     libreoffice-core \
     libreoffice-impress \
