@@ -73,7 +73,7 @@ def emf_to_png_libreoffice(emf_bytes):
             ['libreoffice', '--headless', '--norestore',
              '--infilter=EMF', '--convert-to', 'png',
              '--outdir', '/tmp', emf_path],
-            capture_output=True, timeout=30
+            capture_output=True, timeout=60
         )
         print(f"LibreOffice: rc={r.returncode}, stdout={r.stdout[:100]}, stderr={r.stderr[:200]}", file=sys.stderr)
         
@@ -176,19 +176,13 @@ def parse_exe():
 
         if emf_images:
             png_images = []
-            for emf_bytes in emf_images[:3]:  # Test first 3 only
+            for emf_bytes in emf_images:
                 b64 = emf_to_png(emf_bytes)
                 if b64:
                     png_images.append(b64)
-                    print(f"Converted EMF to PNG, size={len(b64)}", file=sys.stderr)
             
             print(f"PNG converted: {len(png_images)}/{len(emf_images)}", file=sys.stderr)
             
-            # Convert remaining
-            for emf_bytes in emf_images[3:]:
-                b64 = emf_to_png(emf_bytes)
-                if b64: png_images.append(b64)
-
             img_idx = 0
             for q in questions:
                 if q.get('hasImage') and img_idx < len(png_images):
