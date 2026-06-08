@@ -4,11 +4,10 @@ RUN apt-get update && apt-get install -y \
     libreoffice-core \
     libreoffice-impress \
     imagemagick \
-    libmagickcore-6.q16-6-extra \
     --no-install-recommends && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
-    sed -i 's/rights="none" pattern="EMF"/rights="read|write" pattern="EMF"/' /etc/ImageMagick-6/policy.xml || true
+    sed -i 's/rights="none" pattern="EMF"/rights="read|write" pattern="EMF"/' /etc/ImageMagick-6/policy.xml 2>/dev/null || true
 
 WORKDIR /app
 COPY requirements.txt .
