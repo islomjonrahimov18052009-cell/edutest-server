@@ -27,38 +27,45 @@ def find_xml(data):
                 except: pass
     return None
 
-def extract_image_from_rvf(data, pos, length):
-    """Extract JPEG/PNG/BMP image from RVF block"""
+def read_rvf(data, pos, length):
+    """RVF blokidan matn yoki rasm o'qish"""
     if length <= 0 or pos <= 0:
-        return None
+        return None, None
     
     rvf = data[pos:pos+length]
     
-    # JPEG signature
+    # JPEG tekshir
     jpg_start = rvf.find(b'\xff\xd8\xff')
     if jpg_start >= 0:
         jpg_data = rvf[jpg_start:]
         end = jpg_data.rfind(b'\xff\xd9')
-        if end >= 0:
-            jpg_data = jpg_data[:end+2]
-        if len(jpg_data) > 100:
-            return 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
+        if end >= 0: jpg_data = jpg_data[:end+2]
+        if len(jpg_data) > 500:
+            b64 = 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
+            return None, b64
     
-    # PNG signature
+    # PNG tekshir
     png_start = rvf.find(b'\x89PNG\r\n\x1a\n')
     if png_start >= 0:
         png_data = rvf[png_start:]
-        if len(png_data) > 100:
-            return 'data:image/png;base64,' + base64.b64encode(png_data).decode()
+        if len(png_data) > 500:
+            b64 = 'data:image/png;base64,' + base64.b64encode(png_data).decode()
+            return None, b64
     
-    # BMP signature
-    bmp_start = rvf.find(b'BM')
-    if bmp_start >= 0:
-        bmp_data = rvf[bmp_start:]
-        if len(bmp_data) > 100:
-            return 'data:image/bmp;base64,' + base64.b64encode(bmp_data).decode()
+    # UTF-16 matn o'qish (RVF format)
+    # Format: 2 satr format ma'lumoti, keyin UTF-16LE matn
+    lines = rvf.split(b'\r\n')
+    if len(lines) >= 3:
+        text_part = b'\r\n'.join(lines[2:])
+        try:
+            text = text_part.decode('utf-16-le', errors='replace').strip()
+            # Null bytes va boshqa keraksiz belgilarni tozalash
+            text = text.replace('\x00', '').replace('\x29', ')').strip()
+            if len(text) > 2:
+                return text, None
+        except: pass
     
-    return None
+    return None, None
 
 def parse_questions(xml_text, data):
     name_m = re.search(r'<Name>([\s\S]*?)</Name>', xml_text)
@@ -75,41 +82,67 @@ def parse_questions(xml_text, data):
         qtype = type_m.group(1).strip() if type_m else 'MultipleChoice'
         if qtype not in ('MultipleChoice', 'MultipleResponse'): continue
         
-        c_m = re.search(r'<Content>\s*<PlainText>([\s\S]*?)</PlainText>', block)
-        q_text = c_m.group(1).strip() if c_m else ''
+        # PlainText (qisqa versiya)
+        c_m = re.search(r'<Content>\s*<PlainText>([\s\S]*?)</PlainText>[\s\S]*?<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', block)
         
-        # Get RVF position and length
-        rvf_pos_m = re.search(r'<RVFStoredPos>(\d+)</RVFStoredPos>', block)
-        rvf_len_m = re.search(r'<RVFStoredLen>(\d+)</RVFStoredLen>', block)
-        
+        q_text = ''
         img_b64 = None
-        if rvf_pos_m and rvf_len_m:
-            pos = int(rvf_pos_m.group(1))
-            length = int(rvf_len_m.group(1))
-            if length > 500:  # Only check large RVF blocks (small ones are just text)
-                img_b64 = extract_image_from_rvf(data, pos, length)
-                if img_b64:
-                    img_count += 1
+        
+        if c_m:
+            plain = c_m.group(1).strip()
+            rvf_pos = int(c_m.group(2))
+            rvf_len = int(c_m.group(3))
+            
+            # RVF dan to'liq matn yoki rasm olish
+            rvf_text, rvf_img = read_rvf(data, rvf_pos, rvf_len)
+            
+            if rvf_img:
+                # Rasm bor
+                q_text = plain
+                img_b64 = rvf_img
+                img_count += 1
+            elif rvf_text and len(rvf_text) > len(plain):
+                # RVF da to'liq matn bor
+                q_text = rvf_text
+            else:
+                q_text = plain
+        else:
+            plain_m = re.search(r'<Content>\s*<PlainText>([\s\S]*?)</PlainText>', block)
+            q_text = plain_m.group(1).strip() if plain_m else ''
+        
+        if not q_text and not img_b64:
+            continue
         
         opts, corr = [], []
-        for am in re.finditer(r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>\s*<PlainText>([\s\S]*?)</PlainText>', block):
-            a_text = am.group(2).strip()
+        for am in re.finditer(
+            r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>\s*<PlainText>([\s\S]*?)</PlainText>[\s\S]*?<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>',
+            block):
+            a_plain = am.group(2).strip()
+            a_pos = int(am.group(3))
+            a_len = int(am.group(4))
+            
+            # Javob matnini ham RVF dan olish
+            a_rvf_text, _ = read_rvf(data, a_pos, a_len)
+            a_text = a_rvf_text if (a_rvf_text and len(a_rvf_text) > len(a_plain)) else a_plain
+            
             if a_text:
                 opts.append(a_text)
-                if am.group(1) == 'Yes': corr.append(len(opts)-1)
+                if am.group(1) == 'Yes':
+                    corr.append(len(opts)-1)
         
         if len(opts) >= 2 and corr:
             q = {
                 'id': i, 'subject': 'math', 'topic': topic,
-                'text': q_text or '(Rasmga qarang)', 'options': opts,
-                'correct': corr, 'isMulti': qtype == 'MultipleResponse',
+                'text': q_text or '(Rasmga qarang)',
+                'options': opts, 'correct': corr,
+                'isMulti': qtype == 'MultipleResponse',
                 'questionsToAsk': questions_to_ask
             }
             if img_b64:
                 q['img'] = img_b64
             questions.append(q)
     
-    print(f"Questions: {len(questions)}, with images: {img_count}", file=sys.stderr)
+    print(f"Questions: {len(questions)}, images: {img_count}", file=sys.stderr)
     return topic, questions_to_ask, questions
 
 @app.route('/parse', methods=['POST'])
