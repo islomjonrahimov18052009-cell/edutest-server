@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import struct, zlib, re, base64, sys
+import struct, zlib, re, base64, subprocess, tempfile, os, sys
 
 app = Flask(__name__)
 CORS(app)
@@ -52,15 +52,47 @@ def read_rvf(data, pos, length):
             b64 = 'data:image/png;base64,' + base64.b64encode(png_data).decode()
             return None, b64
     
-    # UTF-16 matn o'qish (RVF format)
-    # Format: 2 satr format ma'lumoti, keyin UTF-16LE matn
+    # EMF tekshir (formula rasmi)
+    # Format: "Equation.3\r\nTMetafile\r\n" + 4byte_size + EMF_data
+    tmet_pos = rvf.find(b'TMetafile\r\n')
+    if tmet_pos >= 0:
+        after = rvf[tmet_pos+11:]
+        if len(after) >= 8:
+            emf_size = struct.unpack_from('<I', after, 0)[0]
+            emf_data = after[4:4+emf_size]
+            if len(emf_data) >= emf_size and emf_size > 100:
+                try:
+                    tmpdir = tempfile.mkdtemp()
+                    emf_path = os.path.join(tmpdir, 'f.emf')
+                    png_path = os.path.join(tmpdir, 'f.png')
+                    with open(emf_path, 'wb') as f:
+                        f.write(emf_data)
+                    r = subprocess.run(
+                        ['libreoffice', '--headless', '--norestore',
+                         '--convert-to', 'png', '--outdir', tmpdir, emf_path],
+                        capture_output=True, timeout=30
+                    )
+                    if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
+                        with open(png_path, 'rb') as f:
+                            png_bytes = f.read()
+                        b64 = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+                        return None, b64
+                except Exception as e:
+                    print(f"EMF convert error: {e}", file=sys.stderr)
+                finally:
+                    for fp in [emf_path, png_path]:
+                        try: os.unlink(fp)
+                        except: pass
+                    try: os.rmdir(tmpdir)
+                    except: pass
+    
+    # UTF-16 matn o'qish (oddiy matnli RVF)
     lines = rvf.split(b'\r\n')
     if len(lines) >= 3:
         text_part = b'\r\n'.join(lines[2:])
         try:
             text = text_part.decode('utf-16-le', errors='replace').strip()
-            # Null bytes va boshqa keraksiz belgilarni tozalash
-            text = text.replace('\x00', '').replace('\x29', ')').strip()
+            text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text).strip()
             if len(text) > 2:
                 return text, None
         except: pass
@@ -82,92 +114,103 @@ def parse_questions(xml_text, data):
         qtype = type_m.group(1).strip() if type_m else 'MultipleChoice'
         if qtype not in ('MultipleChoice', 'MultipleResponse'): continue
         
-        # PlainText (qisqa versiya)
-        c_m = re.search(r'<Content>\s*<PlainText>([\s\S]*?)</PlainText>[\s\S]*?<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', block)
+        # === SAVOL MATNINI O'QISH ===
+        # Content bo'limi - faqat birinchi <Content>...</Content> (savol uchun)
+        content_m = re.search(r'<Content>([\s\S]*?)</Content>', block)
         
         q_text = ''
         img_b64 = None
         
-        if c_m:
-            plain = c_m.group(1).strip()
-            rvf_pos = int(c_m.group(2))
-            rvf_len = int(c_m.group(3))
+        if content_m:
+            content = content_m.group(1)
+            plain_m = re.search(r'<PlainText>([\s\S]*?)</PlainText>', content)
+            plain = plain_m.group(1).strip() if plain_m else ''
             
-            # RVF dan to'liq matn yoki rasm olish
-            rvf_text, rvf_img = read_rvf(data, rvf_pos, rvf_len)
+            rvf_m = re.search(r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', content)
             
-            if rvf_img:
-                # Rasm bor
-                q_text = plain
-                img_b64 = rvf_img
-                img_count += 1
-            elif rvf_text and len(rvf_text) > len(plain):
-                # RVF da to'liq matn bor
-                q_text = rvf_text
+            if rvf_m:
+                rvf_pos = int(rvf_m.group(1))
+                rvf_len = int(rvf_m.group(2))
+                rvf_text, rvf_img = read_rvf(data, rvf_pos, rvf_len)
+                
+                if rvf_img:
+                    q_text = plain
+                    img_b64 = rvf_img
+                    img_count += 1
+                elif rvf_text and len(rvf_text) > len(plain):
+                    q_text = rvf_text
+                else:
+                    q_text = plain
             else:
                 q_text = plain
-        else:
-            plain_m = re.search(r'<Content>\s*<PlainText>([\s\S]*?)</PlainText>', block)
-            q_text = plain_m.group(1).strip() if plain_m else ''
         
         if not q_text and not img_b64:
             continue
         
+        # === JAVOBLARNI O'QISH ===
+        # Answers_block - <Answer IsCorrect="..."> taglarini qidirish
         opts, corr = [], []
+        
+        # Barcha Answer taglarini topish
         for am in re.finditer(
-            r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>\s*<PlainText>([\s\S]*?)</PlainText>[\s\S]*?<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>',
+            r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>([\s\S]*?)</Content>',
             block):
-            a_plain = am.group(2).strip()
-            a_pos = int(am.group(3))
-            a_len = int(am.group(4))
+            is_correct = am.group(1)
+            ans_content = am.group(2)
             
-            # Javob matnini ham RVF dan olish
-            a_rvf_text, _ = read_rvf(data, a_pos, a_len)
-            a_text = a_rvf_text if (a_rvf_text and len(a_rvf_text) > len(a_plain)) else a_plain
+            a_plain_m = re.search(r'<PlainText>([\s\S]*?)</PlainText>', ans_content)
+            a_plain = a_plain_m.group(1).strip() if a_plain_m else ''
+            
+            a_rvf_m = re.search(r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', ans_content)
+            
+            a_text = a_plain
+            if a_rvf_m:
+                a_pos = int(a_rvf_m.group(1))
+                a_len = int(a_rvf_m.group(2))
+                a_rvf_text, _ = read_rvf(data, a_pos, a_len)
+                if a_rvf_text and len(a_rvf_text) > len(a_plain):
+                    a_text = a_rvf_text
             
             if a_text:
                 opts.append(a_text)
-                if am.group(1) == 'Yes':
+                if is_correct == 'Yes':
                     corr.append(len(opts)-1)
         
         if len(opts) >= 2 and corr:
             q = {
                 'id': i, 'subject': 'math', 'topic': topic,
-                'text': q_text or '(Rasmga qarang)',
-                'options': opts, 'correct': corr,
-                'isMulti': qtype == 'MultipleResponse',
-                'questionsToAsk': questions_to_ask
+                'text': q_text or '(Rasm)',
+                'options': opts,
+                'correct': corr,
             }
             if img_b64:
-                q['img'] = img_b64
+                q['image'] = img_b64
             questions.append(q)
     
-    print(f"Questions: {len(questions)}, images: {img_count}", file=sys.stderr)
-    return topic, questions_to_ask, questions
+    print(f"Parsed: {len(questions)} questions, {img_count} images", file=sys.stderr)
+    return {'topic': topic, 'questions': questions, 'questionsToAsk': questions_to_ask}
 
-@app.route('/parse', methods=['POST'])
-def parse_exe():
+@app.route('/parse', methods=['POST', 'OPTIONS'])
+def parse():
+    if request.method == 'OPTIONS':
+        return '', 200
     try:
-        data = request.get_data()
-        print(f"File: {len(data)} bytes", file=sys.stderr)
-        if not data or len(data) < 100:
-            return jsonify({'error': 'Fayl bo\'sh'}), 400
-
+        data = request.data
+        if not data:
+            return jsonify({'error': 'No data'}), 400
+        print(f"Received: {len(data)} bytes", file=sys.stderr)
+        
         xml_text = find_xml(data)
         if not xml_text:
-            return jsonify({'error': 'EasyQuizzy fayli tanilmadi'}), 400
-
-        topic, questions_to_ask, questions = parse_questions(xml_text, data)
-        if not questions:
-            return jsonify({'error': 'Savollar topilmadi'}), 400
-
-        return jsonify({'topic': topic, 'questionsToAsk': questions_to_ask, 'questions': questions})
+            return jsonify({'error': 'XML not found'}), 400
+        
+        result = parse_questions(xml_text, data)
+        return jsonify(result)
     except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
