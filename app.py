@@ -27,6 +27,45 @@ def find_xml(data):
                 except: pass
     return None
 
+def emf_to_png_b64(emf_data):
+    """EMF rasmni PNG base64 ga o'girish"""
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix='edutest_')
+        emf_path = os.path.join(tmpdir, 'f.emf')
+        png_path = os.path.join(tmpdir, 'f.png')
+        
+        with open(emf_path, 'wb') as f:
+            f.write(emf_data)
+        
+        env = os.environ.copy()
+        env['HOME'] = tmpdir  # LibreOffice profili uchun
+        
+        for cmd in ['libreoffice', 'soffice']:
+            try:
+                r = subprocess.run(
+                    [cmd, '--headless', '--norestore',
+                     '--convert-to', 'png', '--outdir', tmpdir, emf_path],
+                    capture_output=True, timeout=25, env=env
+                )
+                if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
+                    with open(png_path, 'rb') as f:
+                        png_bytes = f.read()
+                    print(f"EMF->PNG OK: {len(png_bytes)} bytes", file=sys.stderr)
+                    return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+            except Exception as e:
+                print(f"EMF {cmd} error: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"EMF convert error: {e}", file=sys.stderr)
+    finally:
+        if tmpdir:
+            for fp in os.listdir(tmpdir) if tmpdir and os.path.exists(tmpdir) else []:
+                try: os.unlink(os.path.join(tmpdir, fp))
+                except: pass
+            try: os.rmdir(tmpdir)
+            except: pass
+    return None
+
 def read_rvf(data, pos, length):
     """RVF blokidan matn yoki rasm o'qish"""
     if length <= 0 or pos <= 0:
@@ -41,19 +80,16 @@ def read_rvf(data, pos, length):
         end = jpg_data.rfind(b'\xff\xd9')
         if end >= 0: jpg_data = jpg_data[:end+2]
         if len(jpg_data) > 500:
-            b64 = 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
-            return None, b64
+            return None, 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
     
     # PNG tekshir
     png_start = rvf.find(b'\x89PNG\r\n\x1a\n')
     if png_start >= 0:
         png_data = rvf[png_start:]
         if len(png_data) > 500:
-            b64 = 'data:image/png;base64,' + base64.b64encode(png_data).decode()
-            return None, b64
+            return None, 'data:image/png;base64,' + base64.b64encode(png_data).decode()
     
-    # EMF tekshir (formula rasmi)
-    # Format: "Equation.3\r\nTMetafile\r\n" + 4byte_size + EMF_data
+    # EMF (formula) tekshir
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
         after = rvf[tmet_pos+11:]
@@ -61,39 +97,22 @@ def read_rvf(data, pos, length):
             emf_size = struct.unpack_from('<I', after, 0)[0]
             emf_data = after[4:4+emf_size]
             if len(emf_data) >= emf_size and emf_size > 100:
-                try:
-                    tmpdir = tempfile.mkdtemp()
-                    emf_path = os.path.join(tmpdir, 'f.emf')
-                    png_path = os.path.join(tmpdir, 'f.png')
-                    with open(emf_path, 'wb') as f:
-                        f.write(emf_data)
-                    r = subprocess.run(
-                        ['libreoffice', '--headless', '--norestore',
-                         '--convert-to', 'png', '--outdir', tmpdir, emf_path],
-                        capture_output=True, timeout=30
-                    )
-                    if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
-                        with open(png_path, 'rb') as f:
-                            png_bytes = f.read()
-                        b64 = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
-                        return None, b64
-                except Exception as e:
-                    print(f"EMF convert error: {e}", file=sys.stderr)
-                finally:
-                    for fp in [emf_path, png_path]:
-                        try: os.unlink(fp)
-                        except: pass
-                    try: os.rmdir(tmpdir)
-                    except: pass
+                b64 = emf_to_png_b64(emf_data)
+                if b64:
+                    return None, b64
+                # LibreOffice ishlamasa - formula matni sifatida ko'rsat
+                return '(formula)', None
     
-    # UTF-16 matn o'qish (oddiy matnli RVF)
+    # UTF-16 oddiy matn
     lines = rvf.split(b'\r\n')
     if len(lines) >= 3:
         text_part = b'\r\n'.join(lines[2:])
         try:
             text = text_part.decode('utf-16-le', errors='replace').strip()
             text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text).strip()
-            if len(text) > 2:
+            # Agar matn o'qib bo'lmaydigan binary bo'lsa - o'tkazib yubor
+            readable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
+            if len(text) > 2 and readable / max(len(text), 1) > 0.7:
                 return text, None
         except: pass
     
@@ -114,10 +133,8 @@ def parse_questions(xml_text, data):
         qtype = type_m.group(1).strip() if type_m else 'MultipleChoice'
         if qtype not in ('MultipleChoice', 'MultipleResponse'): continue
         
-        # === SAVOL MATNINI O'QISH ===
-        # Content bo'limi - faqat birinchi <Content>...</Content> (savol uchun)
+        # === SAVOL MATNINI O'QISH (faqat birinchi <Content>) ===
         content_m = re.search(r'<Content>([\s\S]*?)</Content>', block)
-        
         q_text = ''
         img_b64 = None
         
@@ -126,7 +143,9 @@ def parse_questions(xml_text, data):
             plain_m = re.search(r'<PlainText>([\s\S]*?)</PlainText>', content)
             plain = plain_m.group(1).strip() if plain_m else ''
             
-            rvf_m = re.search(r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', content)
+            rvf_m = re.search(
+                r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>',
+                content)
             
             if rvf_m:
                 rvf_pos = int(rvf_m.group(1))
@@ -148,10 +167,7 @@ def parse_questions(xml_text, data):
             continue
         
         # === JAVOBLARNI O'QISH ===
-        # Answers_block - <Answer IsCorrect="..."> taglarini qidirish
         opts, corr = [], []
-        
-        # Barcha Answer taglarini topish
         for am in re.finditer(
             r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>([\s\S]*?)</Content>',
             block):
@@ -161,7 +177,9 @@ def parse_questions(xml_text, data):
             a_plain_m = re.search(r'<PlainText>([\s\S]*?)</PlainText>', ans_content)
             a_plain = a_plain_m.group(1).strip() if a_plain_m else ''
             
-            a_rvf_m = re.search(r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>', ans_content)
+            a_rvf_m = re.search(
+                r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>',
+                ans_content)
             
             a_text = a_plain
             if a_rvf_m:
@@ -199,11 +217,9 @@ def parse():
         if not data:
             return jsonify({'error': 'No data'}), 400
         print(f"Received: {len(data)} bytes", file=sys.stderr)
-        
         xml_text = find_xml(data)
         if not xml_text:
             return jsonify({'error': 'XML not found'}), 400
-        
         result = parse_questions(xml_text, data)
         return jsonify(result)
     except Exception as e:
