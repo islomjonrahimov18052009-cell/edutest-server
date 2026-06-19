@@ -54,7 +54,8 @@ def convert_all_emfs(emf_list):
         
         r = subprocess.run(
             ['libreoffice', '--headless', '--norestore',
-             '--convert-to', 'png', '--outdir', tmpdir] + all_emf_paths,
+             '--convert-to', 'png:draw_png_Export:{PixelWidth:1200}',
+             '--outdir', tmpdir] + all_emf_paths,
             capture_output=True, timeout=240, env=env
         )
         print(f"LO rc={r.returncode} stdout={r.stdout.decode()[:200]}", file=sys.stderr)
