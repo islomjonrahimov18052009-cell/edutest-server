@@ -1,4 +1,4 @@
- from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import struct, zlib, re, base64, subprocess, tempfile, os, sys
 
@@ -140,6 +140,10 @@ def read_rvf(data, pos, length):
             # Format 2: 4byte_skip + EMF (K2_1-mavzu turi)
             candidate2 = after[4:]
             if len(candidate2) > 100 and candidate2[:4] == b'\x01\x00\x00\x00':
+                # EMF hajmini headerdan o'qi (offset 4 = nBytes)
+                emf_hdr_size = struct.unpack_from('<I', candidate2, 4)[0]
+                if 100 < emf_hdr_size <= len(candidate2):
+                    return '__EMF__', candidate2[:emf_hdr_size]
                 return '__EMF__', candidate2
             # Format 3: to'g'ridan EMF
             if after[:4] == b'\x01\x00\x00\x00':
