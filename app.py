@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import struct, zlib, re, base64, subprocess, tempfile, os, sys
 
@@ -65,27 +65,19 @@ def convert_all_emfs(emf_list):
             png_path = emf_path.replace('.emf', '.png')
             if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
                 try:
-                    from PIL import Image, ImageOps
+                    from PIL import Image
                     import io
-                    img = Image.open(png_path).convert('RGBA')
-                    # Oq/shaffof fonni crop qilish
-                    bg = Image.new('RGBA', img.size, (255,255,255,255))
-                    diff = Image.fromarray(
-                        __import__('numpy').abs(
-                            __import__('numpy').array(img.convert('RGB'), dtype=int) -
-                            __import__('numpy').array(bg.convert('RGB'), dtype=int)
-                        ).astype('uint8')
-                    )
-                    bbox = diff.convert('L').point(lambda x: 255 if x > 10 else 0).getbbox()
+                    img = Image.open(png_path).convert('RGB')
+                    # Oq chegaralarni crop qilish (numpy siz)
+                    bbox = img.point(lambda x: 0 if x > 240 else 255).convert('L').getbbox()
                     if bbox:
-                        pad = 20
+                        pad = 15
                         w, h = img.size
                         bbox = (max(0,bbox[0]-pad), max(0,bbox[1]-pad),
                                 min(w,bbox[2]+pad), min(h,bbox[3]+pad))
                         img = img.crop(bbox)
-                    # PNG ga saqlash
                     buf = io.BytesIO()
-                    img.convert('RGB').save(buf, format='PNG', optimize=True)
+                    img.save(buf, format='PNG', optimize=True)
                     png_bytes = buf.getvalue()
                 except Exception as e:
                     print(f"  crop err: {e}", file=sys.stderr)
@@ -130,15 +122,28 @@ def read_rvf(data, pos, length):
         if len(png_data) > 500:
             return None, 'data:image/png;base64,' + base64.b64encode(png_data).decode()
 
-    # EMF (formula)
+    # EMF (formula) - ikkita format bor
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
         after = rvf[tmet_pos+11:]
+        # spacing=N\r\n bo'lsa o'tkazib yubor
+        if after.startswith(b'spacing='):
+            nl = after.find(b'\r\n')
+            after = after[nl+2:] if nl >= 0 else after
         if len(after) >= 8:
+            # Format 1: 4byte_size + EMF (29_mavzu turi)
             emf_size = struct.unpack_from('<I', after, 0)[0]
-            if emf_size > 100 and len(after) >= 4 + emf_size:
-                emf_data = after[4:4+emf_size]
-                return '__EMF__', emf_data
+            if 100 < emf_size <= len(after) - 4:
+                candidate = after[4:4+emf_size]
+                if candidate[:4] == b'\x01\x00\x00\x00':
+                    return '__EMF__', candidate
+            # Format 2: 4byte_skip + EMF (K2_1-mavzu turi)
+            candidate2 = after[4:]
+            if len(candidate2) > 100 and candidate2[:4] == b'\x01\x00\x00\x00':
+                return '__EMF__', candidate2
+            # Format 3: to'g'ridan EMF
+            if after[:4] == b'\x01\x00\x00\x00':
+                return '__EMF__', after
 
     # UTF-16 matn
     lines = rvf.split(b'\r\n')
