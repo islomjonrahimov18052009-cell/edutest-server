@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import struct, zlib, re, base64, subprocess, tempfile, os, sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 CORS(app)
@@ -28,41 +27,61 @@ def find_xml(data):
                 except: pass
     return None
 
-def emf_to_png_b64(emf_data, idx=0):
-    """EMF rasmni PNG base64 ga o'girish"""
-    tmpdir = None
+def convert_all_emfs(emf_list):
+    """Barcha EMF larni bitta LibreOffice session da o'girish"""
+    if not emf_list:
+        return {}
+    
+    tmpdir = tempfile.mkdtemp(prefix='edutest_emf_')
+    results = {}  # idx -> base64
+    
     try:
-        tmpdir = tempfile.mkdtemp(prefix=f'eq{idx}_')
-        emf_path = os.path.join(tmpdir, 'f.emf')
-        png_path = os.path.join(tmpdir, 'f.png')
-        with open(emf_path, 'wb') as f:
-            f.write(emf_data)
+        # Barcha EMF fayllarni yozish
+        emf_paths = {}
+        for idx, emf_data in emf_list:
+            emf_path = os.path.join(tmpdir, f'f{idx}.emf')
+            with open(emf_path, 'wb') as f:
+                f.write(emf_data)
+            emf_paths[idx] = emf_path
+        
         env = os.environ.copy()
         env['HOME'] = tmpdir
-        for cmd in ['libreoffice', 'soffice']:
-            try:
-                r = subprocess.run(
-                    [cmd, '--headless', '--norestore',
-                     '--convert-to', 'png', '--outdir', tmpdir, emf_path],
-                    capture_output=True, timeout=20, env=env
-                )
-                if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
-                    with open(png_path, 'rb') as f:
-                        png_bytes = f.read()
-                    print(f"EMF[{idx}]->PNG OK: {len(png_bytes)}b", file=sys.stderr)
-                    return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
-            except Exception as e:
-                print(f"EMF[{idx}] {cmd} err: {e}", file=sys.stderr)
+        
+        # Bitta LibreOffice chaqiruvi - barcha fayllar
+        all_emf_paths = list(emf_paths.values())
+        
+        print(f"Converting {len(all_emf_paths)} EMFs in one LO call...", file=sys.stderr)
+        
+        r = subprocess.run(
+            ['libreoffice', '--headless', '--norestore',
+             '--convert-to', 'png', '--outdir', tmpdir] + all_emf_paths,
+            capture_output=True, timeout=240, env=env
+        )
+        print(f"LO rc={r.returncode} stdout={r.stdout.decode()[:200]}", file=sys.stderr)
+        
+        # PNG fayllarni o'qi
+        for idx, emf_path in emf_paths.items():
+            png_path = emf_path.replace('.emf', '.png')
+            if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
+                with open(png_path, 'rb') as f:
+                    png_bytes = f.read()
+                results[idx] = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+                print(f"  EMF[{idx}] -> {len(png_bytes)}b PNG", file=sys.stderr)
+            else:
+                print(f"  EMF[{idx}] -> FAILED", file=sys.stderr)
+    
+    except subprocess.TimeoutExpired:
+        print("LO timeout!", file=sys.stderr)
     except Exception as e:
-        print(f"EMF[{idx}] error: {e}", file=sys.stderr)
+        print(f"LO error: {e}", file=sys.stderr)
     finally:
-        if tmpdir and os.path.exists(tmpdir):
-            for fp in os.listdir(tmpdir):
-                try: os.unlink(os.path.join(tmpdir, fp))
-                except: pass
-            try: os.rmdir(tmpdir)
+        for fp in os.listdir(tmpdir):
+            try: os.unlink(os.path.join(tmpdir, fp))
             except: pass
-    return None
+        try: os.rmdir(tmpdir)
+        except: pass
+    
+    return results
 
 def read_rvf(data, pos, length):
     if length <= 0 or pos <= 0:
@@ -85,7 +104,7 @@ def read_rvf(data, pos, length):
         if len(png_data) > 500:
             return None, 'data:image/png;base64,' + base64.b64encode(png_data).decode()
 
-    # EMF marker - faqat belgi, asl o'girish keyinroq parallel
+    # EMF (formula)
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
         after = rvf[tmet_pos+11:]
@@ -93,7 +112,7 @@ def read_rvf(data, pos, length):
             emf_size = struct.unpack_from('<I', after, 0)[0]
             if emf_size > 100 and len(after) >= 4 + emf_size:
                 emf_data = after[4:4+emf_size]
-                return '__EMF__', emf_data  # parallel o'girish uchun
+                return '__EMF__', emf_data
 
     # UTF-16 matn
     lines = rvf.split(b'\r\n')
@@ -117,14 +136,14 @@ def parse_questions(xml_text, data):
 
     blocks = re.findall(r'<QuestionBlock[^>]*>([\s\S]*?)</QuestionBlock>', xml_text)
     questions = []
-    emf_tasks = []  # (q_index, emf_data, task_idx)
+    emf_tasks = []  # (q_idx, emf_bytes)
 
-    # 1-pass: barcha savollarni o'qi, EMF larni belgilab qo'y
     for i, block in enumerate(blocks):
         type_m = re.search(r'<QuestionTypeName>(.*?)</QuestionTypeName>', block)
         qtype = type_m.group(1).strip() if type_m else 'MultipleChoice'
         if qtype not in ('MultipleChoice', 'MultipleResponse'): continue
 
+        # Savol
         content_m = re.search(r'<Content>([\s\S]*?)</Content>', block)
         q_text = ''
         img_b64 = None
@@ -142,7 +161,7 @@ def parse_questions(xml_text, data):
                 rt, ri = read_rvf(data, rp, rl)
                 if rt == '__EMF__':
                     q_text = plain or '(formula)'
-                    emf_data_q = ri  # bytes
+                    emf_data_q = ri
                 elif ri:
                     q_text = plain
                     img_b64 = ri
@@ -192,22 +211,11 @@ def parse_questions(xml_text, data):
             if emf_data_q:
                 emf_tasks.append((q_idx, emf_data_q))
 
-    # 2-pass: EMF larni parallel o'gir (max 4 ta bir vaqtda)
+    # Barcha EMF larni bitta LO session da o'gir
     if emf_tasks:
-        print(f"Converting {len(emf_tasks)} EMFs in parallel...", file=sys.stderr)
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futs = {}
-            for task_idx, (q_idx, emf_data) in enumerate(emf_tasks):
-                f = executor.submit(emf_to_png_b64, emf_data, task_idx)
-                futs[f] = q_idx
-            for f in as_completed(futs):
-                q_idx = futs[f]
-                try:
-                    b64 = f.result()
-                    if b64:
-                        questions[q_idx]['image'] = b64
-                except Exception as e:
-                    print(f"EMF future error: {e}", file=sys.stderr)
+        emf_results = convert_all_emfs(emf_tasks)
+        for q_idx, b64 in emf_results.items():
+            questions[q_idx]['image'] = b64
 
     img_count = sum(1 for q in questions if q.get('image'))
     print(f"Done: {len(questions)} questions, {img_count} images", file=sys.stderr)
