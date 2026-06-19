@@ -60,12 +60,37 @@ def convert_all_emfs(emf_list):
         )
         print(f"LO rc={r.returncode} stdout={r.stdout.decode()[:200]}", file=sys.stderr)
         
-        # PNG fayllarni o'qi
+        # PNG fayllarni o'qi va crop qil
         for idx, emf_path in emf_paths.items():
             png_path = emf_path.replace('.emf', '.png')
             if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
-                with open(png_path, 'rb') as f:
-                    png_bytes = f.read()
+                try:
+                    from PIL import Image, ImageOps
+                    import io
+                    img = Image.open(png_path).convert('RGBA')
+                    # Oq/shaffof fonni crop qilish
+                    bg = Image.new('RGBA', img.size, (255,255,255,255))
+                    diff = Image.fromarray(
+                        __import__('numpy').abs(
+                            __import__('numpy').array(img.convert('RGB'), dtype=int) -
+                            __import__('numpy').array(bg.convert('RGB'), dtype=int)
+                        ).astype('uint8')
+                    )
+                    bbox = diff.convert('L').point(lambda x: 255 if x > 10 else 0).getbbox()
+                    if bbox:
+                        pad = 20
+                        w, h = img.size
+                        bbox = (max(0,bbox[0]-pad), max(0,bbox[1]-pad),
+                                min(w,bbox[2]+pad), min(h,bbox[3]+pad))
+                        img = img.crop(bbox)
+                    # PNG ga saqlash
+                    buf = io.BytesIO()
+                    img.convert('RGB').save(buf, format='PNG', optimize=True)
+                    png_bytes = buf.getvalue()
+                except Exception as e:
+                    print(f"  crop err: {e}", file=sys.stderr)
+                    with open(png_path, 'rb') as f:
+                        png_bytes = f.read()
                 results[idx] = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
                 print(f"  EMF[{idx}] -> {len(png_bytes)}b PNG", file=sys.stderr)
             else:
