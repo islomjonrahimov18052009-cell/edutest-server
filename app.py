@@ -212,6 +212,7 @@ def parse_questions(xml_text, data):
 
         # Javoblar
         opts, corr = [], []
+        ans_emf_tasks = []  # (opt_idx, emf_bytes)
         for am in re.finditer(
             r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>([\s\S]*?)</Content>',
             block):
@@ -222,16 +223,25 @@ def parse_questions(xml_text, data):
                 r'<RVFStoredPos>(\d+)</RVFStoredPos>\s*<RVFStoredLen>(\d+)</RVFStoredLen>',
                 ac)
             a_text = a_plain
+            a_emf = None
             if a_rvf_m:
                 a_pos = int(a_rvf_m.group(1))
                 a_len = int(a_rvf_m.group(2))
-                a_rt, _ = read_rvf(data, a_pos, a_len)
-                if a_rt and a_rt != '__EMF__' and len(a_rt) > len(a_plain):
+                a_rt, a_ri = read_rvf(data, a_pos, a_len)
+                if a_rt == '__EMF__':
+                    a_emf = a_ri  # EMF bytes - keyinroq o'giriladi
+                    a_text = a_plain or '▪'
+                elif a_ri:
+                    a_text = a_plain
+                elif a_rt and len(a_rt) > len(a_plain):
                     a_text = a_rt
-            if a_text:
-                opts.append(a_text)
+            if a_text or a_emf:
+                opt_idx = len(opts)
+                opts.append(a_text or '▪')
                 if am.group(1) == 'Yes':
-                    corr.append(len(opts)-1)
+                    corr.append(opt_idx)
+                if a_emf:
+                    ans_emf_tasks.append((opt_idx, a_emf))
 
         if len(opts) >= 2 and corr:
             q_obj = {
@@ -245,12 +255,41 @@ def parse_questions(xml_text, data):
             questions.append(q_obj)
             if emf_data_q:
                 emf_tasks.append((q_idx, emf_data_q))
+            # Javob rasmlari uchun
+            for opt_idx, a_emf in ans_emf_tasks:
+                emf_tasks.append(('opt', q_idx, opt_idx, a_emf))
 
     # Barcha EMF larni bitta LO session da o'gir
     if emf_tasks:
-        emf_results = convert_all_emfs(emf_tasks)
-        for q_idx, b64 in emf_results.items():
-            questions[q_idx]['image'] = b64
+        # Savol va javob EMF larni ajrat
+        q_emf_tasks = [(q_idx, emf) for item in emf_tasks
+                       if len(item)==2 for q_idx, emf in [item]]
+        a_emf_tasks_map = {}  # (q_idx, opt_idx) -> task_idx
+        all_emf_list = []
+        
+        for item in emf_tasks:
+            if len(item) == 2:
+                q_idx, emf = item
+                all_emf_list.append((len(all_emf_list), emf))
+                # store mapping: task_idx -> ('q', q_idx)
+                a_emf_tasks_map[len(all_emf_list)-1] = ('q', q_idx)
+            else:
+                _, q_idx, opt_idx, emf = item
+                all_emf_list.append((len(all_emf_list), emf))
+                a_emf_tasks_map[len(all_emf_list)-1] = ('a', q_idx, opt_idx)
+        
+        emf_results = convert_all_emfs(all_emf_list)
+        
+        for task_idx, b64 in emf_results.items():
+            info = a_emf_tasks_map.get(task_idx)
+            if not info: continue
+            if info[0] == 'q':
+                questions[info[1]]['image'] = b64
+            else:
+                _, q_idx, opt_idx = info
+                if 'optImages' not in questions[q_idx]:
+                    questions[q_idx]['optImages'] = {}
+                questions[q_idx]['optImages'][str(opt_idx)] = b64
 
     img_count = sum(1 for q in questions if q.get('image'))
     print(f"Done: {len(questions)} questions, {img_count} images", file=sys.stderr)
