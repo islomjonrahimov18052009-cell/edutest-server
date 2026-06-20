@@ -50,15 +50,17 @@ def convert_all_emfs(emf_list):
         # Bitta LibreOffice chaqiruvi - barcha fayllar
         all_emf_paths = list(emf_paths.values())
         
-        print(f"Converting {len(all_emf_paths)} EMFs in one LO call...", file=sys.stderr)
-        
-        r = subprocess.run(
-            ['libreoffice', '--headless', '--norestore',
-             '--convert-to', 'png:draw_png_Export:{PixelWidth:1200}',
-             '--outdir', tmpdir] + all_emf_paths,
-            capture_output=True, timeout=240, env=env
-        )
-        print(f"LO rc={r.returncode} stdout={r.stdout.decode()[:200]}", file=sys.stderr)
+        print(f"Converting {len(all_emf_paths)} EMFs in batches...", file=sys.stderr)
+        BATCH = 50
+        for b_start in range(0, len(all_emf_paths), BATCH):
+            batch = all_emf_paths[b_start:b_start+BATCH]
+            r = subprocess.run(
+                ['libreoffice', '--headless', '--norestore',
+                 '--convert-to', 'png:draw_png_Export:{PixelWidth:1200}',
+                 '--outdir', tmpdir] + batch,
+                capture_output=True, timeout=120, env=env
+            )
+            print(f"Batch {b_start//BATCH+1}: rc={r.returncode}", file=sys.stderr)
         
         # PNG fayllarni o'qi va crop qil
         for idx, emf_path in emf_paths.items():
