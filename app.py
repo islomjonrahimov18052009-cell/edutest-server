@@ -230,9 +230,9 @@ def parse_questions(xml_text, data):
                 a_rt, a_ri = read_rvf(data, a_pos, a_len)
                 if a_rt == '__EMF__':
                     a_emf = a_ri  # EMF bytes - keyinroq o'giriladi
-                    a_text = a_plain or ''
+                    a_text = a_plain or '__IMG_PENDING__'
                 elif a_ri:
-                    a_text = a_plain
+                    a_text = a_ri  # JPEG/PNG - to'g'ridan base64
                 elif a_rt and len(a_rt) > len(a_plain):
                     a_text = a_rt
             if a_text is not None or a_emf:
@@ -287,9 +287,9 @@ def parse_questions(xml_text, data):
                 questions[info[1]]['image'] = b64
             else:
                 _, q_idx, opt_idx = info
-                if 'optImages' not in questions[q_idx]:
-                    questions[q_idx]['optImages'] = {}
-                questions[q_idx]['optImages'][str(opt_idx)] = b64
+                # Rasmni to'g'ridan option matniga embed qilamiz
+                if opt_idx < len(questions[q_idx]['options']):
+                    questions[q_idx]['options'][opt_idx] = b64
 
     img_count = sum(1 for q in questions if q.get('image'))
     print(f"Done: {len(questions)} questions, {img_count} images", file=sys.stderr)
