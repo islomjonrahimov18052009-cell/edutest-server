@@ -230,14 +230,14 @@ def parse_questions(xml_text, data):
                 a_rt, a_ri = read_rvf(data, a_pos, a_len)
                 if a_rt == '__EMF__':
                     a_emf = a_ri  # EMF bytes - keyinroq o'giriladi
-                    a_text = a_plain or '▪'
+                    a_text = a_plain or ''
                 elif a_ri:
                     a_text = a_plain
                 elif a_rt and len(a_rt) > len(a_plain):
                     a_text = a_rt
-            if a_text or a_emf:
+            if a_text is not None or a_emf:
                 opt_idx = len(opts)
-                opts.append(a_text or '▪')
+                opts.append(a_text if a_text else '')
                 if am.group(1) == 'Yes':
                     corr.append(opt_idx)
                 if a_emf:
