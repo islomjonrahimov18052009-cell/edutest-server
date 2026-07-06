@@ -302,7 +302,19 @@ def parse():
     if request.method == 'OPTIONS':
         return '', 200
     try:
-        data = request.data
+        content_type = (request.content_type or '')
+        if 'application/json' in content_type:
+            # Yangi usul: brauzer faylni Base64 qilib JSON ichida yuboradi
+            # (ba'zi antivirus/tarmoq himoyalari .exe baytlarini togridan-togri
+            # yuborishni bloklaydi, shuning uchun matn/JSON korinishida yuboriladi)
+            body = request.get_json(force=True, silent=True) or {}
+            b64 = body.get('data', '')
+            if not b64:
+                return jsonify({'error': 'No data'}), 400
+            data = base64.b64decode(b64)
+        else:
+            # Eski usul: togridan-togri binary
+            data = request.data
         if not data:
             return jsonify({'error': 'No data'}), 400
         print(f"Received: {len(data)} bytes", file=sys.stderr)
