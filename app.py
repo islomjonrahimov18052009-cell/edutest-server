@@ -303,9 +303,9 @@ def parse():
 @app.route('/parse_batch', methods=['POST', 'OPTIONS'])
 def parse_batch():
     """Bir nechta faylni BIR SO'ROVDA qabul qiladi va BARCHA formulalarni
-    faqat BITTA LibreOffice sessiyasida o'giradi - bu 35 ta faylni
-    birma-bir yuborishdan ANCHA tezroq (har safar LibreOffice qayta
-    ishga tushishining oldini oladi)."""
+    faqat BITTA LibreOffice sessiyasida o'giradi. Eski (sinxron) versiya -
+    Render'ning uzoq sorovlarni majburan uzib qoyishi sababli endi
+    ishlatilmaydi, lekin orqaga moslik uchun qoldirilgan."""
     if request.method == 'OPTIONS':
         return '', 200
     try:
@@ -313,13 +313,78 @@ def parse_batch():
         files = body.get('files', [])
         if not files:
             return jsonify({'error': 'No files'}), 400
+        file_results, file_emf_tasks = _process_files_raw(files)
+        _resolve_batch_emfs(file_results, file_emf_tasks)
+        return jsonify({'results': file_results})
+    except Exception as e:
+        print(f"Batch error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
 
-        print(f"Batch: {len(files)} fayl qabul qilindi", file=sys.stderr)
 
-        file_results = []       # har fayl uchun {filename, topic, questions, questionsToAsk, error}
-        file_emf_tasks = []     # har fayl uchun emf_tasks royxati (parallel index)
+def _process_files_raw(files):
+    file_results = []
+    file_emf_tasks = []
+    for f in files:
+        fname = f.get('filename', 'fayl')
+        try:
+            data = base64.b64decode(f.get('data', ''))
+            xml_text = find_xml(data)
+            if not xml_text:
+                file_results.append({'filename': fname, 'error': 'XML not found'})
+                file_emf_tasks.append([])
+                continue
+            topic, questions, emf_tasks, qta = extract_questions_raw(xml_text, data)
+            file_results.append({'filename': fname, 'topic': topic, 'questions': questions, 'questionsToAsk': qta})
+            file_emf_tasks.append(emf_tasks)
+        except Exception as e:
+            print(f"  {fname}: xato {e}", file=sys.stderr)
+            file_results.append({'filename': fname, 'error': str(e)})
+            file_emf_tasks.append([])
+    return file_results, file_emf_tasks
 
-        for f in files:
+
+def _resolve_batch_emfs(file_results, file_emf_tasks, job_id=None):
+    global_list = []
+    global_map = []
+    for fi, tasks in enumerate(file_emf_tasks):
+        for t in tasks:
+            global_list.append((len(global_list), t['emf']))
+            global_map.append((fi, t))
+    if job_id:
+        JOBS[job_id]['progress'] = f'{len(global_list)} ta formula/rasm 1 sessiyada ogirilmoqda...'
+    emf_results = convert_all_emfs(global_list)
+    for gidx, b64 in emf_results.items():
+        fi, t = global_map[gidx]
+        res = file_results[fi]
+        if 'questions' not in res:
+            continue
+        if t['kind'] == 'q':
+            res['questions'][t['q_idx']]['image'] = b64
+        else:
+            opts = res['questions'][t['q_idx']]['options']
+            if t['opt_idx'] < len(opts):
+                opts[t['opt_idx']] = b64
+
+
+# ─── FON VAZIFA (BACKGROUND JOB) TIZIMI ────────────────────────────────────
+# Render.com (va boshqa hosting'lar) uzoq davom etadigan HTTP sorovlarni
+# ozi majburan uzib qoyadi (odatda 30-100 soniyadan keyin), garchi bizning
+# kod hali ishlab turgan bolsa ham. Buni chetlab otish uchun: katta ishni
+# ORQA FONDA (alohida thread'da) qilamiz, brauzer esa tez-tez "tayyor
+# bo'ldimi?" deb sorab turadi (polling). Har bir sorovning ozi tez
+# (sub-sekund) bolgani uchun Render uni hech qachon uzib qoymaydi.
+import threading, uuid
+
+JOBS = {}  # job_id -> {'status':'processing'|'done'|'error', 'progress':str, 'results':[...], 'error':str}
+
+def _run_batch_job(job_id, files):
+    try:
+        JOBS[job_id]['progress'] = f'0/{len(files)} fayl oqildi'
+        file_results = []
+        file_emf_tasks = []
+        for i, f in enumerate(files):
             fname = f.get('filename', 'fayl')
             try:
                 data = base64.b64decode(f.get('data', ''))
@@ -327,46 +392,58 @@ def parse_batch():
                 if not xml_text:
                     file_results.append({'filename': fname, 'error': 'XML not found'})
                     file_emf_tasks.append([])
-                    continue
-                topic, questions, emf_tasks, qta = extract_questions_raw(xml_text, data)
-                file_results.append({'filename': fname, 'topic': topic, 'questions': questions, 'questionsToAsk': qta})
-                file_emf_tasks.append(emf_tasks)
+                else:
+                    topic, questions, emf_tasks, qta = extract_questions_raw(xml_text, data)
+                    file_results.append({'filename': fname, 'topic': topic, 'questions': questions, 'questionsToAsk': qta})
+                    file_emf_tasks.append(emf_tasks)
             except Exception as e:
                 print(f"  {fname}: xato {e}", file=sys.stderr)
                 file_results.append({'filename': fname, 'error': str(e)})
                 file_emf_tasks.append([])
+            JOBS[job_id]['progress'] = f'{i+1}/{len(files)} fayl oqildi'
 
-        # Barcha fayllardagi EMF larni BITTA royxatga yigamiz
-        global_list = []
-        global_map = []  # (file_idx, task)
-        for fi, tasks in enumerate(file_emf_tasks):
-            for t in tasks:
-                global_list.append((len(global_list), t['emf']))
-                global_map.append((fi, t))
+        _resolve_batch_emfs(file_results, file_emf_tasks, job_id)
 
-        print(f"Batch: jami {len(global_list)} ta formula/rasm, 1 LO sessiyada ogiriladi", file=sys.stderr)
-        emf_results = convert_all_emfs(global_list)
-
-        for gidx, b64 in emf_results.items():
-            fi, t = global_map[gidx]
-            res = file_results[fi]
-            if 'questions' not in res:
-                continue
-            if t['kind'] == 'q':
-                res['questions'][t['q_idx']]['image'] = b64
-            else:
-                opts = res['questions'][t['q_idx']]['options']
-                if t['opt_idx'] < len(opts):
-                    opts[t['opt_idx']] = b64
-
-        ok_count = sum(1 for r in file_results if 'questions' in r)
-        print(f"Batch tugadi: {ok_count}/{len(files)} muvaffaqiyatli", file=sys.stderr)
-        return jsonify({'results': file_results})
+        JOBS[job_id]['status'] = 'done'
+        JOBS[job_id]['results'] = file_results
+        JOBS[job_id]['progress'] = 'Tugadi'
+        ok = sum(1 for r in file_results if 'questions' in r)
+        print(f"Job {job_id}: tugadi, {ok}/{len(files)} muvaffaqiyatli", file=sys.stderr)
     except Exception as e:
-        print(f"Batch error: {e}", file=sys.stderr)
+        print(f"Job {job_id} error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
-        return jsonify({'error': str(e)}), 500
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['error'] = str(e)
+
+
+@app.route('/parse_batch_start', methods=['POST', 'OPTIONS'])
+def parse_batch_start():
+    if request.method == 'OPTIONS':
+        return '', 200
+    body = request.get_json(force=True, silent=True) or {}
+    files = body.get('files', [])
+    if not files:
+        return jsonify({'error': 'No files'}), 400
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {'status': 'processing', 'progress': 'Boshlanmoqda...'}
+    t = threading.Thread(target=_run_batch_job, args=(job_id, files), daemon=True)
+    t.start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/parse_batch_status/<job_id>', methods=['GET'])
+def parse_batch_status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    resp = {'status': job['status'], 'progress': job.get('progress', '')}
+    if job['status'] == 'done':
+        resp['results'] = job['results']
+    if job['status'] == 'error':
+        resp['error'] = job.get('error', 'Nomalum xato')
+    return jsonify(resp)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
