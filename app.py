@@ -28,41 +28,39 @@ def find_xml(data):
     return None
 
 def convert_all_emfs(emf_list):
-    """Barcha EMF larni bitta LibreOffice session da o'girish"""
+    """Barcha EMF larni bitta LibreOffice session da o'girish.
+    emf_list: [(idx, emf_bytes), ...] - idx dunyoning istalgan raqami bolishi mumkin"""
     if not emf_list:
         return {}
-    
+
     tmpdir = tempfile.mkdtemp(prefix='edutest_emf_')
     results = {}  # idx -> base64
-    
+
     try:
-        # Barcha EMF fayllarni yozish
         emf_paths = {}
         for idx, emf_data in emf_list:
             emf_path = os.path.join(tmpdir, f'f{idx}.emf')
             with open(emf_path, 'wb') as f:
                 f.write(emf_data)
             emf_paths[idx] = emf_path
-        
+
         env = os.environ.copy()
         env['HOME'] = tmpdir
-        
-        # Bitta LibreOffice chaqiruvi - barcha fayllar
+
         all_emf_paths = list(emf_paths.values())
-        
-        print(f"Converting {len(all_emf_paths)} EMFs in batches...", file=sys.stderr)
-        BATCH = 50
+
+        print(f"Converting {len(all_emf_paths)} EMFs in batches (1 LO session)...", file=sys.stderr)
+        BATCH = 80
         for b_start in range(0, len(all_emf_paths), BATCH):
             batch = all_emf_paths[b_start:b_start+BATCH]
             r = subprocess.run(
                 ['libreoffice', '--headless', '--norestore',
                  '--convert-to', 'png:draw_png_Export:{PixelWidth:1200}',
                  '--outdir', tmpdir] + batch,
-                capture_output=True, timeout=120, env=env
+                capture_output=True, timeout=300, env=env
             )
             print(f"Batch {b_start//BATCH+1}: rc={r.returncode}", file=sys.stderr)
-        
-        # PNG fayllarni o'qi va crop qil
+
         for idx, emf_path in emf_paths.items():
             png_path = emf_path.replace('.emf', '.png')
             if os.path.exists(png_path) and os.path.getsize(png_path) > 2000:
@@ -70,7 +68,6 @@ def convert_all_emfs(emf_list):
                     from PIL import Image
                     import io
                     img = Image.open(png_path).convert('RGB')
-                    # Oq chegaralarni crop qilish (numpy siz)
                     bbox = img.point(lambda x: 0 if x > 240 else 255).convert('L').getbbox()
                     if bbox:
                         pad = 15
@@ -86,10 +83,9 @@ def convert_all_emfs(emf_list):
                     with open(png_path, 'rb') as f:
                         png_bytes = f.read()
                 results[idx] = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
-                print(f"  EMF[{idx}] -> {len(png_bytes)}b PNG", file=sys.stderr)
             else:
                 print(f"  EMF[{idx}] -> FAILED", file=sys.stderr)
-    
+
     except subprocess.TimeoutExpired:
         print("LO timeout!", file=sys.stderr)
     except Exception as e:
@@ -100,7 +96,7 @@ def convert_all_emfs(emf_list):
             except: pass
         try: os.rmdir(tmpdir)
         except: pass
-    
+
     return results
 
 def read_rvf(data, pos, length):
@@ -108,7 +104,6 @@ def read_rvf(data, pos, length):
         return None, None
     rvf = data[pos:pos+length]
 
-    # JPEG
     jpg_start = rvf.find(b'\xff\xd8\xff')
     if jpg_start >= 0:
         jpg_data = rvf[jpg_start:]
@@ -117,41 +112,33 @@ def read_rvf(data, pos, length):
         if len(jpg_data) > 500:
             return None, 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
 
-    # PNG
     png_start = rvf.find(b'\x89PNG\r\n\x1a\n')
     if png_start >= 0:
         png_data = rvf[png_start:]
         if len(png_data) > 500:
             return None, 'data:image/png;base64,' + base64.b64encode(png_data).decode()
 
-    # EMF (formula) - ikkita format bor
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
         after = rvf[tmet_pos+11:]
-        # spacing=N\r\n bo'lsa o'tkazib yubor
         if after.startswith(b'spacing='):
             nl = after.find(b'\r\n')
             after = after[nl+2:] if nl >= 0 else after
         if len(after) >= 8:
-            # Format 1: 4byte_size + EMF (29_mavzu turi)
             emf_size = struct.unpack_from('<I', after, 0)[0]
             if 100 < emf_size <= len(after) - 4:
                 candidate = after[4:4+emf_size]
                 if candidate[:4] == b'\x01\x00\x00\x00':
                     return '__EMF__', candidate
-            # Format 2: 4byte_skip + EMF (K2_1-mavzu turi)
             candidate2 = after[4:]
             if len(candidate2) > 100 and candidate2[:4] == b'\x01\x00\x00\x00':
-                # EMF hajmini headerdan o'qi (offset 4 = nBytes)
                 emf_hdr_size = struct.unpack_from('<I', candidate2, 4)[0]
                 if 100 < emf_hdr_size <= len(candidate2):
                     return '__EMF__', candidate2[:emf_hdr_size]
                 return '__EMF__', candidate2
-            # Format 3: to'g'ridan EMF
             if after[:4] == b'\x01\x00\x00\x00':
                 return '__EMF__', after
 
-    # UTF-16 matn
     lines = rvf.split(b'\r\n')
     if len(lines) >= 3:
         text_part = b'\r\n'.join(lines[2:])
@@ -165,7 +152,10 @@ def read_rvf(data, pos, length):
 
     return None, None
 
-def parse_questions(xml_text, data):
+def extract_questions_raw(xml_text, data):
+    """parse_questions bilan bir xil, lekin EMF larni konvertatsiya QILMAYDI -
+    faqat xom emf_tasks royxatini qaytaradi. Bu bir nechta faylni birlashtirib,
+    hammasini BITTA LibreOffice chaqiruvida ogirish uchun kerak (tezlik uchun)."""
     name_m = re.search(r'<Name>([\s\S]*?)</Name>', xml_text)
     topic = name_m.group(1).strip() if name_m else 'Test'
     qta_m = re.search(r'<QuestionsToAsk>(\d+)</QuestionsToAsk>', xml_text)
@@ -173,14 +163,13 @@ def parse_questions(xml_text, data):
 
     blocks = re.findall(r'<QuestionBlock[^>]*>([\s\S]*?)</QuestionBlock>', xml_text)
     questions = []
-    emf_tasks = []  # (q_idx, emf_bytes)
+    emf_tasks = []  # {'kind':'q'|'a', 'q_idx':i, 'opt_idx':j, 'emf':bytes}
 
     for i, block in enumerate(blocks):
         type_m = re.search(r'<QuestionTypeName>(.*?)</QuestionTypeName>', block)
         qtype = type_m.group(1).strip() if type_m else 'MultipleChoice'
         if qtype not in ('MultipleChoice', 'MultipleResponse'): continue
 
-        # Savol
         content_m = re.search(r'<Content>([\s\S]*?)</Content>', block)
         q_text = ''
         img_b64 = None
@@ -212,9 +201,8 @@ def parse_questions(xml_text, data):
         if not q_text and not img_b64 and not emf_data_q:
             continue
 
-        # Javoblar
         opts, corr = [], []
-        ans_emf_tasks = []  # (opt_idx, emf_bytes)
+        ans_emf_tasks = []
         for am in re.finditer(
             r'<Answer\s+IsCorrect="(Yes|No)"[\s\S]*?<Content>([\s\S]*?)</Content>',
             block):
@@ -231,10 +219,10 @@ def parse_questions(xml_text, data):
                 a_len = int(a_rvf_m.group(2))
                 a_rt, a_ri = read_rvf(data, a_pos, a_len)
                 if a_rt == '__EMF__':
-                    a_emf = a_ri  # EMF bytes - keyinroq o'giriladi
+                    a_emf = a_ri
                     a_text = a_plain or '__IMG_PENDING__'
                 elif a_ri:
-                    a_text = a_ri  # JPEG/PNG - to'g'ridan base64
+                    a_text = a_ri
                 elif a_rt and len(a_rt) > len(a_plain):
                     a_text = a_rt
             if a_text is not None or a_emf:
@@ -256,43 +244,30 @@ def parse_questions(xml_text, data):
             q_idx = len(questions)
             questions.append(q_obj)
             if emf_data_q:
-                emf_tasks.append((q_idx, emf_data_q))
-            # Javob rasmlari uchun
+                emf_tasks.append({'kind': 'q', 'q_idx': q_idx, 'emf': emf_data_q})
             for opt_idx, a_emf in ans_emf_tasks:
-                emf_tasks.append(('opt', q_idx, opt_idx, a_emf))
+                emf_tasks.append({'kind': 'a', 'q_idx': q_idx, 'opt_idx': opt_idx, 'emf': a_emf})
 
-    # Barcha EMF larni bitta LO session da o'gir
-    if emf_tasks:
-        # Savol va javob EMF larni ajrat
-        q_emf_tasks = [(q_idx, emf) for item in emf_tasks
-                       if len(item)==2 for q_idx, emf in [item]]
-        a_emf_tasks_map = {}  # (q_idx, opt_idx) -> task_idx
-        all_emf_list = []
-        
-        for item in emf_tasks:
-            if len(item) == 2:
-                q_idx, emf = item
-                all_emf_list.append((len(all_emf_list), emf))
-                # store mapping: task_idx -> ('q', q_idx)
-                a_emf_tasks_map[len(all_emf_list)-1] = ('q', q_idx)
-            else:
-                _, q_idx, opt_idx, emf = item
-                all_emf_list.append((len(all_emf_list), emf))
-                a_emf_tasks_map[len(all_emf_list)-1] = ('a', q_idx, opt_idx)
-        
-        emf_results = convert_all_emfs(all_emf_list)
-        
-        for task_idx, b64 in emf_results.items():
-            info = a_emf_tasks_map.get(task_idx)
-            if not info: continue
-            if info[0] == 'q':
-                questions[info[1]]['image'] = b64
-            else:
-                _, q_idx, opt_idx = info
-                # Rasmni to'g'ridan option matniga embed qilamiz
-                if opt_idx < len(questions[q_idx]['options']):
-                    questions[q_idx]['options'][opt_idx] = b64
+    return topic, questions, emf_tasks, questions_to_ask
 
+def resolve_emf_tasks(questions, emf_tasks):
+    """Bitta fayl uchun: emf_tasks larni konvertatsiya qilib, questions ichiga joylaydi"""
+    if not emf_tasks:
+        return
+    emf_list = [(idx, t['emf']) for idx, t in enumerate(emf_tasks)]
+    emf_results = convert_all_emfs(emf_list)
+    for idx, b64 in emf_results.items():
+        t = emf_tasks[idx]
+        if t['kind'] == 'q':
+            questions[t['q_idx']]['image'] = b64
+        else:
+            opts = questions[t['q_idx']]['options']
+            if t['opt_idx'] < len(opts):
+                opts[t['opt_idx']] = b64
+
+def parse_questions(xml_text, data):
+    topic, questions, emf_tasks, questions_to_ask = extract_questions_raw(xml_text, data)
+    resolve_emf_tasks(questions, emf_tasks)
     img_count = sum(1 for q in questions if q.get('image'))
     print(f"Done: {len(questions)} questions, {img_count} images", file=sys.stderr)
     return {'topic': topic, 'questions': questions, 'questionsToAsk': questions_to_ask}
@@ -304,16 +279,12 @@ def parse():
     try:
         content_type = (request.content_type or '')
         if 'application/json' in content_type:
-            # Yangi usul: brauzer faylni Base64 qilib JSON ichida yuboradi
-            # (ba'zi antivirus/tarmoq himoyalari .exe baytlarini togridan-togri
-            # yuborishni bloklaydi, shuning uchun matn/JSON korinishida yuboriladi)
             body = request.get_json(force=True, silent=True) or {}
             b64 = body.get('data', '')
             if not b64:
                 return jsonify({'error': 'No data'}), 400
             data = base64.b64decode(b64)
         else:
-            # Eski usul: togridan-togri binary
             data = request.data
         if not data:
             return jsonify({'error': 'No data'}), 400
@@ -325,6 +296,74 @@ def parse():
         return jsonify(result)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/parse_batch', methods=['POST', 'OPTIONS'])
+def parse_batch():
+    """Bir nechta faylni BIR SO'ROVDA qabul qiladi va BARCHA formulalarni
+    faqat BITTA LibreOffice sessiyasida o'giradi - bu 35 ta faylni
+    birma-bir yuborishdan ANCHA tezroq (har safar LibreOffice qayta
+    ishga tushishining oldini oladi)."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        files = body.get('files', [])
+        if not files:
+            return jsonify({'error': 'No files'}), 400
+
+        print(f"Batch: {len(files)} fayl qabul qilindi", file=sys.stderr)
+
+        file_results = []       # har fayl uchun {filename, topic, questions, questionsToAsk, error}
+        file_emf_tasks = []     # har fayl uchun emf_tasks royxati (parallel index)
+
+        for f in files:
+            fname = f.get('filename', 'fayl')
+            try:
+                data = base64.b64decode(f.get('data', ''))
+                xml_text = find_xml(data)
+                if not xml_text:
+                    file_results.append({'filename': fname, 'error': 'XML not found'})
+                    file_emf_tasks.append([])
+                    continue
+                topic, questions, emf_tasks, qta = extract_questions_raw(xml_text, data)
+                file_results.append({'filename': fname, 'topic': topic, 'questions': questions, 'questionsToAsk': qta})
+                file_emf_tasks.append(emf_tasks)
+            except Exception as e:
+                print(f"  {fname}: xato {e}", file=sys.stderr)
+                file_results.append({'filename': fname, 'error': str(e)})
+                file_emf_tasks.append([])
+
+        # Barcha fayllardagi EMF larni BITTA royxatga yigamiz
+        global_list = []
+        global_map = []  # (file_idx, task)
+        for fi, tasks in enumerate(file_emf_tasks):
+            for t in tasks:
+                global_list.append((len(global_list), t['emf']))
+                global_map.append((fi, t))
+
+        print(f"Batch: jami {len(global_list)} ta formula/rasm, 1 LO sessiyada ogiriladi", file=sys.stderr)
+        emf_results = convert_all_emfs(global_list)
+
+        for gidx, b64 in emf_results.items():
+            fi, t = global_map[gidx]
+            res = file_results[fi]
+            if 'questions' not in res:
+                continue
+            if t['kind'] == 'q':
+                res['questions'][t['q_idx']]['image'] = b64
+            else:
+                opts = res['questions'][t['q_idx']]['options']
+                if t['opt_idx'] < len(opts):
+                    opts[t['opt_idx']] = b64
+
+        ok_count = sum(1 for r in file_results if 'questions' in r)
+        print(f"Batch tugadi: {ok_count}/{len(files)} muvaffaqiyatli", file=sys.stderr)
+        return jsonify({'results': file_results})
+    except Exception as e:
+        print(f"Batch error: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc(file=sys.stderr)
         return jsonify({'error': str(e)}), 500
