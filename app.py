@@ -50,12 +50,12 @@ def convert_all_emfs(emf_list):
         all_emf_paths = list(emf_paths.values())
 
         print(f"Converting {len(all_emf_paths)} EMFs in batches (1 LO session)...", file=sys.stderr)
-        BATCH = 80
+        BATCH = 25
         for b_start in range(0, len(all_emf_paths), BATCH):
             batch = all_emf_paths[b_start:b_start+BATCH]
             r = subprocess.run(
                 ['libreoffice', '--headless', '--norestore',
-                 '--convert-to', 'png:draw_png_Export:{PixelWidth:1200}',
+                 '--convert-to', 'png:draw_png_Export:{PixelWidth:700}',
                  '--outdir', tmpdir] + batch,
                 capture_output=True, timeout=300, env=env
             )
@@ -78,13 +78,23 @@ def convert_all_emfs(emf_list):
                     buf = io.BytesIO()
                     img.save(buf, format='PNG', optimize=True)
                     png_bytes = buf.getvalue()
+                    img.close()
+                    buf.close()
                 except Exception as e:
                     print(f"  crop err: {e}", file=sys.stderr)
                     with open(png_path, 'rb') as f:
                         png_bytes = f.read()
                 results[idx] = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+                del png_bytes
             else:
                 print(f"  EMF[{idx}] -> FAILED", file=sys.stderr)
+            # Rasm faylini darhol ochirib, diskni ham bosh qilamiz
+            try: os.unlink(png_path)
+            except: pass
+            try: os.unlink(emf_path)
+            except: pass
+        import gc
+        gc.collect()
 
     except subprocess.TimeoutExpired:
         print("LO timeout!", file=sys.stderr)
@@ -362,7 +372,7 @@ def _resolve_batch_emfs(file_results, file_emf_tasks, job_id=None):
     # foydalanuvchi progressni real vaqtda kora oladi (qotib qolganday
     # tuyulmasligi uchun), va bitta LibreOffice chaqiruvi haddan tashqari
     # katta bolib ketmaydi.
-    CHUNK = 150
+    CHUNK = 40
     for start in range(0, total, CHUNK):
         chunk = global_list[start:start+CHUNK]
         chunk_results = convert_all_emfs(chunk)
