@@ -352,20 +352,36 @@ def _resolve_batch_emfs(file_results, file_emf_tasks, job_id=None):
         for t in tasks:
             global_list.append((len(global_list), t['emf']))
             global_map.append((fi, t))
+    total = len(global_list)
+    if not total:
+        return
     if job_id:
-        JOBS[job_id]['progress'] = f'{len(global_list)} ta formula/rasm 1 sessiyada ogirilmoqda...'
-    emf_results = convert_all_emfs(global_list)
-    for gidx, b64 in emf_results.items():
-        fi, t = global_map[gidx]
-        res = file_results[fi]
-        if 'questions' not in res:
-            continue
-        if t['kind'] == 'q':
-            res['questions'][t['q_idx']]['image'] = b64
-        else:
-            opts = res['questions'][t['q_idx']]['options']
-            if t['opt_idx'] < len(opts):
-                opts[t['opt_idx']] = b64
+        JOBS[job_id]['progress'] = f'0/{total} rasm/formula ogirilmoqda...'
+
+    # Kattaroq royxatlarni kichikroq boliklarga bolib ishlaymiz - shunda
+    # foydalanuvchi progressni real vaqtda kora oladi (qotib qolganday
+    # tuyulmasligi uchun), va bitta LibreOffice chaqiruvi haddan tashqari
+    # katta bolib ketmaydi.
+    CHUNK = 150
+    for start in range(0, total, CHUNK):
+        chunk = global_list[start:start+CHUNK]
+        chunk_results = convert_all_emfs(chunk)
+        for gidx, b64 in chunk_results.items():
+            fi, t = global_map[gidx]
+            res = file_results[fi]
+            if 'questions' not in res:
+                continue
+            if t['kind'] == 'q':
+                res['questions'][t['q_idx']]['image'] = b64
+            else:
+                opts = res['questions'][t['q_idx']]['options']
+                if t['opt_idx'] < len(opts):
+                    opts[t['opt_idx']] = b64
+        done = min(start+CHUNK, total)
+        if job_id:
+            JOBS[job_id]['progress'] = f'{done}/{total} rasm/formula ogirildi...'
+        print(f"  EMF progress: {done}/{total}", file=sys.stderr)
+    return
 
 
 # ─── FON VAZIFA (BACKGROUND JOB) TIZIMI ────────────────────────────────────
@@ -427,6 +443,8 @@ def parse_batch_start():
         return jsonify({'error': 'No files'}), 400
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {'status': 'processing', 'progress': 'Boshlanmoqda...'}
+    JOB_TIMESTAMPS[job_id] = _time.time()
+    _cleanup_stale_jobs()
     t = threading.Thread(target=_run_batch_job, args=(job_id, files), daemon=True)
     t.start()
     return jsonify({'job_id': job_id})
@@ -434,15 +452,35 @@ def parse_batch_start():
 
 @app.route('/parse_batch_status/<job_id>', methods=['GET'])
 def parse_batch_status(job_id):
+    _cleanup_stale_jobs()
     job = JOBS.get(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
     resp = {'status': job['status'], 'progress': job.get('progress', '')}
     if job['status'] == 'done':
         resp['results'] = job['results']
+        # Natija olib bolindi - xotirani bosh qilish uchun jobni ochiramiz.
+        # (Rasmlar bilan togla katta bolgani uchun, xotirada qoldirib
+        # qoyish serverni "toldirib" qoyishi mumkin edi.)
+        JOBS.pop(job_id, None)
+        JOB_TIMESTAMPS.pop(job_id, None)
     if job['status'] == 'error':
         resp['error'] = job.get('error', 'Nomalum xato')
+        JOBS.pop(job_id, None)
+        JOB_TIMESTAMPS.pop(job_id, None)
     return jsonify(resp)
+
+# Xavfsizlik uchun: agar biror sababdan mijoz natijani hech qachon
+# so'ramasa (masalan brauzer yopilib qolsa), 2 soatdan keyin eski
+# joblarni avtomatik tozalaymiz - xotira sekin-asta toldirilmasin.
+import time as _time
+JOB_TIMESTAMPS = {}
+def _cleanup_stale_jobs():
+    now = _time.time()
+    stale = [jid for jid, ts in list(JOB_TIMESTAMPS.items()) if now - ts > 7200]
+    for jid in stale:
+        JOBS.pop(jid, None)
+        JOB_TIMESTAMPS.pop(jid, None)
 
 
 if __name__ == '__main__':
