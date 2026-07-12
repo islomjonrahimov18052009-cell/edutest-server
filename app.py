@@ -131,9 +131,18 @@ def read_rvf(data, pos, length):
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
         after = rvf[tmet_pos+11:]
-        if after.startswith(b'spacing='):
+        # TMetafile'dan keyin "spacing=", "width=", "height=" kabi bir nechta
+        # metama'lumot qatorlari kelishi mumkin (obyekt turiga qarab har xil).
+        # Hammasini o'tkazib yuboramiz, faqat binary EMF boshlanguncha.
+        while True:
             nl = after.find(b'\r\n')
-            after = after[nl+2:] if nl >= 0 else after
+            if nl < 0 or nl > 40:
+                break
+            line = after[:nl]
+            if b'=' in line and all(32 <= c < 127 for c in line):
+                after = after[nl+2:]
+            else:
+                break
         if len(after) >= 8:
             emf_size = struct.unpack_from('<I', after, 0)[0]
             if 100 < emf_size <= len(after) - 4:
