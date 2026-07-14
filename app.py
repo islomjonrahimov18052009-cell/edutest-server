@@ -257,6 +257,7 @@ def extract_questions_raw(xml_text, data):
                 'id': i, 'subject': 'math', 'topic': topic,
                 'text': q_text or '(Rasm)',
                 'options': opts, 'correct': corr,
+                'isMulti': (qtype == 'MultipleResponse') or (len(corr) > 1),
             }
             if img_b64:
                 q_obj['image'] = img_b64
