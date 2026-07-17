@@ -50,7 +50,11 @@ def convert_all_emfs(emf_list):
         all_emf_paths = list(emf_paths.values())
 
         print(f"Converting {len(all_emf_paths)} EMFs in batches (1 LO session)...", file=sys.stderr)
-        BATCH = 45
+        # MUHIM: Render "Free" tarifi atigi 512 MB xotira beradi. Bitta
+        # LibreOffice chaqiruvida juda kop fayl bolsa, xotira tugab (OOM)
+        # butun server qulab tushishi mumkin edi. Shuning uchun BATCH kichik
+        # tutilgan - sekinroq, lekin barqaror.
+        BATCH = 15
         for b_start in range(0, len(all_emf_paths), BATCH):
             batch = all_emf_paths[b_start:b_start+BATCH]
             r = subprocess.run(
@@ -382,7 +386,11 @@ def _resolve_batch_emfs(file_results, file_emf_tasks, job_id=None):
     # foydalanuvchi progressni real vaqtda kora oladi (qotib qolganday
     # tuyulmasligi uchun), va bitta LibreOffice chaqiruvi haddan tashqari
     # katta bolib ketmaydi.
-    CHUNK = 90
+    # MUHIM: Render "Free" tarifi (512 MB RAM, 0.1 vCPU) uchun bu qiymat
+    # ANIQ kamaytirilgan - avval 90 edi, endi 30. Kattaroq CHUNK bir vaqtning
+    # ozida juda kop EMF'ni xotiraga yuklab, OOM (xotira tugashi) sabab
+    # butun serverni qulatib qoyishi mumkin edi.
+    CHUNK = 30
     for start in range(0, total, CHUNK):
         chunk = global_list[start:start+CHUNK]
         chunk_results = convert_all_emfs(chunk)
