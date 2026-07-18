@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import struct, zlib, re, base64, subprocess, tempfile, os, sys
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -8,6 +9,104 @@ CORS(app)
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
+# GROQ_API_KEY endi bu yerda, SERVER MUHIT OZGARUVCHISI sifatida saqlanadi -
+# oldin index.html ichida ochiq turgan edi, hamma korishi mumkin edi. Render
+# Dashboard > Environment da GROQ_API_KEY nomli ozgaruvchi qoshish kerak.
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+
+# Supabase jadvaliga (edutest_store) endi FAQAT shu server orqali, "service
+# role" kaliti bilan kiriladi - bu kalit RLS'ni chetlab otadi va HECH QACHON
+# brauzerga chiqarilmaydi. Render Dashboard > Environment'da SUPABASE_URL va
+# SUPABASE_SERVICE_KEY nomli ozgaruvchilarni qoshish kerak (Supabase Dashboard
+# > Settings > API > "service_role" kaliti - "anon" kaliti EMAS).
+SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://ykpegjtexjwddsfgwwpw.supabase.co')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+DB_KEY = 'edutest_v3'
+
+@app.route('/db_get', methods=['GET', 'OPTIONS'])
+def db_get():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/edutest_store',
+            params={'key': f'eq.{DB_KEY}', 'select': 'value'},
+            headers={
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+            },
+            timeout=15
+        )
+        if r.status_code >= 400:
+            return jsonify({'error': f'Supabase xato: {r.status_code}'}), 502
+        data = r.json()
+        if data and len(data) > 0:
+            return jsonify({'value': data[0]['value']})
+        return jsonify({'value': None})
+    except Exception as e:
+        print(f"db_get error: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/db_save', methods=['POST', 'OPTIONS'])
+def db_save():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        value = body.get('value')
+        if value is None:
+            return jsonify({'error': 'No value'}), 400
+        r = requests.post(
+            f'{SUPABASE_URL}/rest/v1/edutest_store',
+            headers={
+                'apikey': SUPABASE_SERVICE_KEY,
+                'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+                'Content-Type': 'application/json',
+                'Prefer': 'resolution=merge-duplicates',
+            },
+            json={'key': DB_KEY, 'value': value},
+            timeout=15
+        )
+        if r.status_code >= 400:
+            return jsonify({'error': f'Supabase xato: {r.status_code} {r.text[:200]}'}), 502
+        return jsonify({'ok': True})
+    except Exception as e:
+        print(f"db_save error: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/ai_check', methods=['POST', 'OPTIONS'])
+def ai_check():
+    """Frontend endi Groq'ga togridan-togri emas, shu endpoint orqali murojaat
+    qiladi - shunda haqiqiy API kalit brauzerga hech qachon chiqmaydi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not GROQ_API_KEY:
+        return jsonify({'error': "AI tekshirish xizmati sozlanmagan (serverda GROQ_API_KEY yoq)"}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        messages = body.get('messages')
+        if not messages:
+            return jsonify({'error': 'No messages'}), 400
+        r = requests.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
+            json={
+                'model': body.get('model', 'llama-3.3-70b-versatile'),
+                'messages': messages,
+                'max_tokens': body.get('max_tokens', 1000),
+                'temperature': body.get('temperature', 0.1),
+            },
+            timeout=60
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        print(f"ai_check error: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
 
 def find_xml(data):
     for i in range(len(data)-6, max(0, len(data)-2000000), -1):
