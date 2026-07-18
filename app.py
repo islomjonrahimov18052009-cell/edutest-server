@@ -654,6 +654,246 @@ def parse_document():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── KITOBDAN TEST TUZISH (AI generatsiya) ────────────────────────────────
+# Bu yuqoridagi /parse_document'dan TUBDAN farq qiladi: u yerda AI mavjud
+# savollarni MATNDAN TOPADI, bu yerda esa AI oddiy darslik/kitob matnidan
+# YANGI savollarni OZI TUZADI. Kitob "mavzu"larga (boblarga) bolinadi -
+# sarlavha uslubi (Word "Heading") yoki shrift olchami (PDF) orqali
+# aniqlanadi; agar sarlavha topilmasa, teng bolimlarga bolinadi.
+
+def extract_pdf_sections(data):
+    """PDF'ni shrift olchami/qalinligi asosida mavzu(bob)larga ajratadi."""
+    import fitz
+    from collections import Counter
+    doc = fitz.open(stream=data, filetype='pdf')
+    all_lines = []
+    for page in doc:
+        blocks = page.get_text('dict').get('blocks', [])
+        for b in blocks:
+            if b.get('type') != 0:
+                continue
+            for line in b.get('lines', []):
+                line_text, sizes, bolds = '', [], []
+                for span in line.get('spans', []):
+                    line_text += span.get('text', '')
+                    sizes.append(span.get('size', 0))
+                    bolds.append(bool(span.get('flags', 0) & 16))
+                line_text = line_text.strip()
+                if line_text:
+                    avg_size = sum(sizes) / len(sizes) if sizes else 0
+                    all_lines.append({'text': line_text, 'size': avg_size, 'bold': any(bolds)})
+    doc.close()
+    if not all_lines:
+        return []
+    size_counts = Counter(round(l['size']) for l in all_lines)
+    body_size = size_counts.most_common(1)[0][0] if size_counts else 12
+
+    sections, cur_title, cur_text = [], None, []
+    for l in all_lines:
+        is_heading = (l['size'] > body_size * 1.25 or (l['bold'] and l['size'] >= body_size)) \
+            and len(l['text']) < 80 and len(l['text'].split()) < 12
+        if is_heading:
+            if cur_title and cur_text:
+                sections.append({'title': cur_title, 'text': '\n'.join(cur_text)})
+            cur_title, cur_text = l['text'], []
+        else:
+            cur_text.append(l['text'])
+    if cur_title and cur_text:
+        sections.append({'title': cur_title, 'text': '\n'.join(cur_text)})
+
+    if not sections:
+        full_text = '\n'.join(l['text'] for l in all_lines)
+        sections = _split_into_word_chunks(full_text)
+    sections = [s for s in sections if len(s['text'].split()) > 30]
+    return sections
+
+
+def extract_docx_sections(data):
+    """DOCX'ni Word'ning "Heading" uslublari (yoki qalin qisqa qatorlar)
+    asosida mavzu(bob)larga ajratadi."""
+    import docx
+    doc = docx.Document(io.BytesIO(data))
+    sections, cur_title, cur_text = [], None, []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        style_name = (para.style.name or '') if para.style else ''
+        is_heading = style_name.lower().startswith('heading') or style_name.lower().startswith('title')
+        if not is_heading and len(text) < 80 and len(text.split()) < 12:
+            real_runs = [r for r in para.runs if r.text.strip()]
+            if real_runs and all(r.bold for r in real_runs):
+                is_heading = True
+        if is_heading:
+            if cur_title and cur_text:
+                sections.append({'title': cur_title, 'text': '\n'.join(cur_text)})
+            cur_title, cur_text = text, []
+        else:
+            cur_text.append(text)
+    if cur_title and cur_text:
+        sections.append({'title': cur_title, 'text': '\n'.join(cur_text)})
+
+    if not sections:
+        full_text = '\n'.join(p.text for p in doc.paragraphs if p.text.strip())
+        sections = _split_into_word_chunks(full_text)
+    sections = [s for s in sections if len(s['text'].split()) > 30]
+    return sections
+
+
+def _split_into_word_chunks(full_text, chunk_words=2500):
+    words = full_text.split()
+    if not words:
+        return []
+    chunks = [' '.join(words[i:i+chunk_words]) for i in range(0, len(words), chunk_words)]
+    return [{'title': f'Bo\'lim {i+1}', 'text': c} for i, c in enumerate(chunks)]
+
+
+def generate_questions_from_content(text_chunk, topic_name, n_questions):
+    if not GROQ_API_KEY:
+        raise Exception('AI xizmati sozlanmagan (serverda GROQ_API_KEY yoq)')
+    MAX_CHARS = 12000
+    if len(text_chunk) > MAX_CHARS:
+        text_chunk = text_chunk[:MAX_CHARS]
+    n_questions = max(1, min(int(n_questions or 5), 30))
+    prompt = (
+        f"Sen tajribali ustozsan. Quyidagi darslik/oquv matni asosida ANIQ {n_questions} ta "
+        "test savoli tuz.\n\n"
+        "QATIY TALABLAR:\n"
+        "- Savollar MURAKKAB va CHUQUR bolishi SHART - oddiy eslab qolish emas, balki "
+        "tushunish, taqqoslash, tahlil qilish yoki qollash darajasida bolsin.\n"
+        "- Har bir savolda ANIQ 4 ta variant, ulardan FAQAT BITTASI togri.\n"
+        "- Notogri variantlar (distraktorlar) HAQIQATAN ishonarli va chalgituvchi bolsin - "
+        "mavzuga oid, yuzaki qaraganda togriday tuyuladigan tushunchalar bolsin.\n"
+        "- Savollar FAQAT berilgan matn mazmuniga asoslansin, undan tashqari malumot qoshma.\n"
+        "- FAQAT JSON qaytar, boshqa hech narsa yozma:\n"
+        "{\"questions\": [{\"text\": \"...\", \"options\": [\"...\",\"...\",\"...\",\"...\"], "
+        "\"correct\": [0], \"isMulti\": false}]}\n\n"
+        f"Mavzu: {topic_name}\n\n"
+        "Matn:\n" + text_chunk
+    )
+    r = requests.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
+        json={
+            'model': 'llama-3.3-70b-versatile',
+            'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 8000,
+            'temperature': 0.4,
+            'response_format': {'type': 'json_object'},
+        },
+        timeout=90,
+    )
+    result = r.json()
+    if 'error' in result:
+        raise Exception(str(result['error']))
+    content = result['choices'][0]['message']['content'].strip()
+    if content.startswith('```'):
+        content = re.sub(r'^```[a-zA-Z]*\n?', '', content)
+        content = re.sub(r'```\s*$', '', content)
+    parsed = json.loads(content)
+    return parsed.get('questions', [])
+
+
+def _run_generate_job(job_id, filename, data, mode, total_questions):
+    try:
+        ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+        JOBS[job_id]['progress'] = "Fayldan matn va mavzular ajratilmoqda..."
+        if ext == 'pdf':
+            sections = extract_pdf_sections(data)
+        elif ext == 'docx':
+            sections = extract_docx_sections(data)
+        elif ext == 'txt':
+            sections = [{'title': filename.rsplit('.', 1)[0], 'text': data.decode('utf-8', errors='replace')}]
+        else:
+            JOBS[job_id]['status'] = 'error'
+            JOBS[job_id]['error'] = 'Fayl turi qollab-quvvatlanmaydi (.pdf, .docx, .txt)'
+            return
+        if not sections:
+            JOBS[job_id]['status'] = 'error'
+            JOBS[job_id]['error'] = 'Fayldan yetarli matn topilmadi'
+            return
+
+        MAX_SECTIONS = 15
+        if len(sections) > MAX_SECTIONS:
+            sections = sections[:MAX_SECTIONS]
+
+        results = []
+        if mode == 'per_topic':
+            for i, sec in enumerate(sections):
+                JOBS[job_id]['progress'] = f'Savollar tuzilmoqda: "{sec["title"]}" ({i+1}/{len(sections)})...'
+                qs = generate_questions_from_content(sec['text'], sec['title'], total_questions)
+                if qs:
+                    results.append({'topic': sec['title'], 'questions': qs, 'questionsToAsk': len(qs)})
+        else:
+            per_section = max(1, int(total_questions) // len(sections))
+            all_qs = []
+            for i, sec in enumerate(sections):
+                JOBS[job_id]['progress'] = f'Savollar tuzilmoqda: bolim {i+1}/{len(sections)}...'
+                qs = generate_questions_from_content(sec['text'], sec['title'], per_section)
+                all_qs.extend(qs)
+            topic_name = filename.rsplit('.', 1)[0]
+            all_qs = all_qs[:int(total_questions)] if total_questions else all_qs
+            results.append({'topic': topic_name, 'questions': all_qs, 'questionsToAsk': len(all_qs)})
+
+        for res in results:
+            for i, q in enumerate(res['questions']):
+                q['id'] = f'{int(time.time()*1000)}_{i}_{uuid.uuid4().hex[:6]}'
+                q.setdefault('subject', 'math')
+                if 'isMulti' not in q:
+                    q['isMulti'] = len(q.get('correct', [])) > 1
+
+        JOBS[job_id]['status'] = 'done'
+        JOBS[job_id]['results'] = results
+        JOBS[job_id]['progress'] = 'Tugadi'
+        total_qs = sum(len(r['questions']) for r in results)
+        print(f"generate job {job_id}: {len(results)} mavzu, {total_qs} savol", file=sys.stderr)
+    except Exception as e:
+        print(f"generate job {job_id} error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['error'] = str(e)
+
+
+@app.route('/generate_test_start', methods=['POST', 'OPTIONS'])
+def generate_test_start():
+    if request.method == 'OPTIONS':
+        return '', 200
+    body = request.get_json(force=True, silent=True) or {}
+    b64 = body.get('data', '')
+    filename = body.get('filename', 'kitob')
+    mode = body.get('mode', 'overall')
+    total_questions = int(body.get('total_questions', 20))
+    if not b64:
+        return jsonify({'error': 'No data'}), 400
+    data = base64.b64decode(b64)
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {'status': 'processing', 'progress': 'Boshlanmoqda...'}
+    JOB_TIMESTAMPS[job_id] = _time.time()
+    _cleanup_stale_jobs()
+    t = threading.Thread(target=_run_generate_job, args=(job_id, filename, data, mode, total_questions), daemon=True)
+    t.start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/generate_test_status/<job_id>', methods=['GET'])
+def generate_test_status(job_id):
+    _cleanup_stale_jobs()
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    resp = {'status': job['status'], 'progress': job.get('progress', '')}
+    if job['status'] == 'done':
+        resp['results'] = job['results']
+        JOBS.pop(job_id, None)
+        JOB_TIMESTAMPS.pop(job_id, None)
+    if job['status'] == 'error':
+        resp['error'] = job.get('error', 'Nomalum xato')
+        JOBS.pop(job_id, None)
+        JOB_TIMESTAMPS.pop(job_id, None)
+    return jsonify(resp)
+
+
 @app.route('/parse_batch', methods=['POST', 'OPTIONS'])
 def parse_batch():
     """Bir nechta faylni BIR SO'ROVDA qabul qiladi va BARCHA formulalarni
