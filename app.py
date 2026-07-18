@@ -435,6 +435,10 @@ def parse():
 
 def extract_docx_content(data):
     """DOCX fayldan paragraflar tartibida matn va rasm ornlarini chiqaradi.
+    MUHIM: qalin (bold) va tagiga chizilgan (underline) matnni **belgi**
+    bilan saqlab qoladi - aks holda ustoz togri javobni qalin qilib
+    belgilagan bolsa ham, bu ma'lumot AI'ga yetib bormay, hech qanday togri
+    javob topilmas edi.
     Qaytaradi: (matn, {placeholder: (rasm_bytes, ext)})"""
     import docx
     doc = docx.Document(io.BytesIO(data))
@@ -455,7 +459,11 @@ def extract_docx_content(data):
         line_parts = []
         for run in para.runs:
             if run.text:
-                line_parts.append(run.text)
+                t = run.text
+                is_marked = bool(run.bold) or bool(run.underline) or bool(run.font.highlight_color)
+                if is_marked and t.strip():
+                    t = '**' + t + '**'
+                line_parts.append(t)
             for blip in run._element.findall('.//' + ns_a + 'blip'):
                 rId = blip.get(ns_r + 'embed')
                 if rId:
@@ -472,7 +480,8 @@ def extract_docx_content(data):
 
 def extract_pdf_content(data):
     """PDF fayldan sahifa boyicha matn va rasmlarni Y-koordinata (joylashuv)
-    tartibida chiqaradi."""
+    tartibida chiqaradi. Qalin (bold) matn ham **belgi** bilan saqlanadi -
+    PyMuPDF span flags orqali aniqlanadi (bit4 = bold)."""
     import fitz
     doc = fitz.open(stream=data, filetype='pdf')
     images = {}
@@ -486,7 +495,11 @@ def extract_pdf_content(data):
                 text = ''
                 for line in b.get('lines', []):
                     for span in line.get('spans', []):
-                        text += span.get('text', '')
+                        span_text = span.get('text', '')
+                        is_bold = bool(span.get('flags', 0) & 16) or ('bold' in span.get('font', '').lower())
+                        if is_bold and span_text.strip():
+                            span_text = '**' + span_text + '**'
+                        text += span_text
                     text += '\n'
                 if text.strip():
                     items.append((b['bbox'][1], text.strip()))
@@ -530,8 +543,15 @@ def parse_text_with_ai(text):
         "\"options\": [\"variant1\",\"variant2\"], \"correct\": [0], \"isMulti\": false}]}\n"
         "- \"correct\" - togri javob(lar)ning options ichidagi index(lar)i (0 dan boshlanadi).\n"
         "- Agar bir nechta togri javob bolsa, isMulti:true va correct bir nechta index bolsin.\n"
-        "- Agar togri javob ANIQ belgilanmagan bolsa (yulduzcha, qalin, \"Javob:\" kabi izoh yoq), "
-        "oshu savolni OTKAZIB YUBOR - taxmin qilma.\n"
+        "- MUHIM: matnda **ikki yulduzcha orasidagi** qism - bu asl hujjatda QALIN, TAGIGA "
+        "CHIZILGAN yoki BELGILANGAN (highlight) matnni bildiradi. O'qituvchilar odatda TOGRI "
+        "JAVOBNI aynan shu tarzda (qalin qilib) belgilaydilar - shuning uchun variant matni "
+        "**qalin** bolsa, o'sha variant TOGRI JAVOB deb hisobla. Variantning FAQAT bir qismi "
+        "qalin bolsa ham (masalan raqami yoki bitta sozi), butun variant togri hisoblanadi.\n"
+        "- Agar hech qanday variant qalin qilinmagan VA \"Javob:\", \"togri:\" kabi aniq izoh "
+        "ham yoq bolsa, o'sha savolni OTKAZIB YUBOR - taxmin qilma.\n"
+        "- JSON javobingda **belgilarini OLIB TASHLA (ular faqat sen uchun ishora, natijaviy "
+        "matnda bolmasligi kerak) - masalan \"**4**\" emas, faqat \"4\" deb yoz.\n"
         "- Matnda [RASM_N] kabi belgilar bolishi mumkin - bular rasm ornini bildiradi. Bu "
         "belgilarni ANIQ ozgarishsiz saqlab qol. Agar savol yoki variant BUTUNLAY rasmdan "
         "iborat bolsa, oshu maydonda FAQAT placeholder'ni yoz (masalan faqat \"[RASM_2]\"), "
