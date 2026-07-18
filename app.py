@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import struct, zlib, re, base64, subprocess, tempfile, os, sys
+import struct, zlib, re, base64, subprocess, tempfile, os, sys, io, json, time, uuid
 import requests
 
 app = Flask(__name__)
@@ -422,6 +422,217 @@ def parse():
         import traceback
         traceback.print_exc(file=sys.stderr)
         return jsonify({'error': str(e)}), 500
+
+
+# ─── BOSHQA FAYL TURLARI (Word/PDF/TXT) - AI ORQALI TAHLIL ────────────────
+# EasyQuizzy .exe fayllar QATIY strukturaga ega bolgani uchun regex bilan
+# ochib olinadi. Lekin Word/PDF/TXT fayllar HAR XIL formatda yozilishi
+# mumkin - shuning uchun bu yerda: 1) fayldan matn+rasmlarni (joylashuv
+# tartibida, rasm ornida [RASM_N] belgisi bilan) chiqarib olamiz, 2) shu
+# matnni AI'ga (Groq) berib, savol/variant/togri-javob strukturasini
+# chiqarishni soraymiz, 3) AI qaytargan [RASM_N] belgilarni haqiqiy rasmga
+# almashtiramiz.
+
+def extract_docx_content(data):
+    """DOCX fayldan paragraflar tartibida matn va rasm ornlarini chiqaradi.
+    Qaytaradi: (matn, {placeholder: (rasm_bytes, ext)})"""
+    import docx
+    doc = docx.Document(io.BytesIO(data))
+    images = {}
+    img_counter = [0]
+    ns_a = '{http://schemas.openxmlformats.org/drawingml/2006/main}'
+    ns_r = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+    lines = []
+
+    def get_image_bytes(rId):
+        try:
+            part = doc.part.related_parts[rId]
+            return part.blob
+        except Exception:
+            return None
+
+    for para in doc.paragraphs:
+        line_parts = []
+        for run in para.runs:
+            if run.text:
+                line_parts.append(run.text)
+            for blip in run._element.findall('.//' + ns_a + 'blip'):
+                rId = blip.get(ns_r + 'embed')
+                if rId:
+                    img_bytes = get_image_bytes(rId)
+                    if img_bytes:
+                        img_counter[0] += 1
+                        ph = f'[RASM_{img_counter[0]}]'
+                        images[ph] = (img_bytes, 'png')
+                        line_parts.append(ph)
+        if line_parts:
+            lines.append(''.join(line_parts))
+    return '\n'.join(lines), images
+
+
+def extract_pdf_content(data):
+    """PDF fayldan sahifa boyicha matn va rasmlarni Y-koordinata (joylashuv)
+    tartibida chiqaradi."""
+    import fitz
+    doc = fitz.open(stream=data, filetype='pdf')
+    images = {}
+    img_counter = [0]
+    lines = []
+    for page in doc:
+        blocks = page.get_text('dict').get('blocks', [])
+        items = []
+        for b in blocks:
+            if b.get('type') == 0:
+                text = ''
+                for line in b.get('lines', []):
+                    for span in line.get('spans', []):
+                        text += span.get('text', '')
+                    text += '\n'
+                if text.strip():
+                    items.append((b['bbox'][1], text.strip()))
+            elif b.get('type') == 1:
+                img_bytes = b.get('image')
+                ext = b.get('ext', 'png')
+                if img_bytes:
+                    img_counter[0] += 1
+                    ph = f'[RASM_{img_counter[0]}]'
+                    images[ph] = (img_bytes, ext)
+                    items.append((b['bbox'][1], ph))
+        items.sort(key=lambda x: x[0])
+        for _, content in items:
+            lines.append(content)
+    doc.close()
+    return '\n'.join(lines), images
+
+
+def extract_content_from_file(filename, data):
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    if ext == 'docx':
+        return extract_docx_content(data)
+    elif ext == 'pdf':
+        return extract_pdf_content(data)
+    elif ext == 'txt':
+        return data.decode('utf-8', errors='replace'), {}
+    return None, {}
+
+
+def parse_text_with_ai(text):
+    if not GROQ_API_KEY:
+        raise Exception('AI xizmati sozlanmagan (serverda GROQ_API_KEY yoq)')
+    MAX_CHARS = 40000
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+    prompt = (
+        "Quyidagi hujjat matnidan test savollarini JSON korinishida chiqarib ol.\n"
+        "QATIY QOIDALAR:\n"
+        "- FAQAT JSON qaytar, boshqa hech qanday matn, izoh yoki markdown yozma.\n"
+        "- Format: {\"topic\": \"mavzu nomi\", \"questions\": [{\"text\": \"savol matni\", "
+        "\"options\": [\"variant1\",\"variant2\"], \"correct\": [0], \"isMulti\": false}]}\n"
+        "- \"correct\" - togri javob(lar)ning options ichidagi index(lar)i (0 dan boshlanadi).\n"
+        "- Agar bir nechta togri javob bolsa, isMulti:true va correct bir nechta index bolsin.\n"
+        "- Agar togri javob ANIQ belgilanmagan bolsa (yulduzcha, qalin, \"Javob:\" kabi izoh yoq), "
+        "oshu savolni OTKAZIB YUBOR - taxmin qilma.\n"
+        "- Matnda [RASM_N] kabi belgilar bolishi mumkin - bular rasm ornini bildiradi. Bu "
+        "belgilarni ANIQ ozgarishsiz saqlab qol. Agar savol yoki variant BUTUNLAY rasmdan "
+        "iborat bolsa, oshu maydonda FAQAT placeholder'ni yoz (masalan faqat \"[RASM_2]\"), "
+        "boshqa matn qoshma.\n"
+        "- \"topic\" - hujjat sarlavhasi yoki mazmuniga mos qisqa nom.\n\n"
+        "Matn:\n" + text
+    )
+    r = requests.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
+        json={
+            'model': 'llama-3.3-70b-versatile',
+            'messages': [{'role': 'user', 'content': prompt}],
+            'max_tokens': 8000,
+            'temperature': 0.1,
+            'response_format': {'type': 'json_object'},
+        },
+        timeout=90,
+    )
+    result = r.json()
+    if 'error' in result:
+        raise Exception(str(result['error']))
+    content = result['choices'][0]['message']['content'].strip()
+    if content.startswith('```'):
+        content = re.sub(r'^```[a-zA-Z]*\n?', '', content)
+        content = re.sub(r'```\s*$', '', content)
+    return json.loads(content)
+
+
+def substitute_image_placeholders(questions, images):
+    def resolve(s):
+        if not isinstance(s, str):
+            return s
+        m = re.fullmatch(r'\[RASM_(\d+)\]', s.strip())
+        if not m:
+            return s
+        ph = f'[RASM_{m.group(1)}]'
+        if ph not in images:
+            return s
+        img_bytes, ext = images[ph]
+        mime = 'jpeg' if ext.lower() in ('jpg', 'jpeg') else 'png'
+        try:
+            from PIL import Image
+            im = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            buf = io.BytesIO()
+            im.save(buf, format='PNG', optimize=True)
+            img_bytes = buf.getvalue()
+            mime = 'png'
+        except Exception:
+            pass
+        return f'data:image/{mime};base64,' + base64.b64encode(img_bytes).decode()
+
+    for q in questions:
+        qtext = (q.get('text') or '').strip()
+        resolved = resolve(qtext)
+        if resolved != qtext:
+            q['img'] = resolved
+            q['text'] = ''
+        q['options'] = [resolve(o) for o in q.get('options', [])]
+    return questions
+
+
+@app.route('/parse_document', methods=['POST', 'OPTIONS'])
+def parse_document():
+    """Word (.docx), PDF (.pdf) va oddiy matn (.txt) fayllardan savol
+    import qilish - AI (Groq) yordamida erkin formatdagi matnni
+    strukturaga solib beradi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        b64 = body.get('data', '')
+        filename = body.get('filename', 'fayl')
+        if not b64:
+            return jsonify({'error': 'No data'}), 400
+        data = base64.b64decode(b64)
+        text, images = extract_content_from_file(filename, data)
+        if text is None:
+            return jsonify({'error': "Fayl turi qollab-quvvatlanmaydi (.docx, .pdf, .txt qollab-quvvatlanadi)"}), 400
+        if not text.strip():
+            return jsonify({'error': 'Fayldan matn topilmadi'}), 400
+        parsed = parse_text_with_ai(text)
+        questions = parsed.get('questions', [])
+        if not questions:
+            return jsonify({'error': "Fayldan hech qanday savol aniqlanmadi (togri javob belgilanmagan bolishi mumkin)"}), 400
+        questions = substitute_image_placeholders(questions, images)
+        for i, q in enumerate(questions):
+            q['id'] = f'{int(time.time()*1000)}_{i}_{uuid.uuid4().hex[:6]}'
+            q.setdefault('subject', 'math')
+            if 'isMulti' not in q:
+                q['isMulti'] = len(q.get('correct', [])) > 1
+        topic = parsed.get('topic') or filename.rsplit('.', 1)[0]
+        img_count = sum(1 for q in questions if q.get('img'))
+        print(f"parse_document: {filename} -> {len(questions)} savol, {img_count} rasm", file=sys.stderr)
+        return jsonify({'topic': topic, 'questions': questions, 'questionsToAsk': len(questions)})
+    except Exception as e:
+        print(f"parse_document error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/parse_batch', methods=['POST', 'OPTIONS'])
 def parse_batch():
