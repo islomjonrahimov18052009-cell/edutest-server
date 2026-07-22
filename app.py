@@ -654,6 +654,81 @@ def parse_document():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── RASMDAN SAVOL O'QISH (Vision AI) ──────────────────────────────────────
+# Test sahifasining fotosurati (.jpg/.png) tashlanganda - AI RASMNING OZINI
+# korib, savol/variant/togri javobni aniqlaydi. Togri javob odatda nuqta,
+# doira yoki boshqa belgi bilan korsatiladi - AI shu belgini izlaydi.
+GROQ_VISION_MODEL = os.environ.get('GROQ_VISION_MODEL', 'llama-3.2-90b-vision-preview')
+
+@app.route('/parse_image', methods=['POST', 'OPTIONS'])
+def parse_image():
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not GROQ_API_KEY:
+        return jsonify({'error': 'AI xizmati sozlanmagan (serverda GROQ_API_KEY yoq)'}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        b64 = body.get('data', '')
+        filename = body.get('filename', 'rasm')
+        if not b64:
+            return jsonify({'error': 'No data'}), 400
+        mime = 'image/png' if filename.lower().endswith('.png') else 'image/jpeg'
+        prompt_text = (
+            "Bu rasmda test savoli(lari) va variantlari bor. Rasmni diqqat bilan tahlil qil.\n"
+            "QATIY QOIDALAR:\n"
+            "- Togri javob odatda variant yonida NUQTA, TOLDIRILGAN DOIRA, GALOCHKA (✓), "
+            "AYLANTIRIB CHIZILGAN yoki shunga oxshash BELGI bilan korsatilgan boladi - shu "
+            "belgi qoyilgan variantni TOGRI JAVOB deb bilgila.\n"
+            "- Agar hech qanday variantda belgi topilmasa, oshu savolni OTKAZIB YUBOR - "
+            "taxmin qilma.\n"
+            "- Rasmda bir nechta savol bolsa, hammasini chiqar.\n"
+            "- FAQAT JSON qaytar, boshqa hech narsa yozma:\n"
+            "{\"questions\": [{\"text\": \"savol matni\", \"options\": [\"variant1\",\"variant2\"], "
+            "\"correct\": [0], \"isMulti\": false}]}\n"
+        )
+        r = requests.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
+            json={
+                'model': GROQ_VISION_MODEL,
+                'messages': [{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt_text},
+                        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
+                    ],
+                }],
+                'max_tokens': 4000,
+                'temperature': 0.1,
+                'response_format': {'type': 'json_object'},
+            },
+            timeout=60,
+        )
+        result = r.json()
+        if 'error' in result:
+            return jsonify({'error': f"AI xatosi (model: {GROQ_VISION_MODEL}): " + str(result['error'])}), 502
+        content = result['choices'][0]['message']['content'].strip()
+        if content.startswith('```'):
+            content = re.sub(r'^```[a-zA-Z]*\n?', '', content)
+            content = re.sub(r'```\s*$', '', content)
+        parsed = json.loads(content)
+        questions = parsed.get('questions', [])
+        if not questions:
+            return jsonify({'error': "Rasmdan savol aniqlanmadi (togri javob belgisi topilmagan bolishi mumkin)"}), 400
+        for i, q in enumerate(questions):
+            q['id'] = f'{int(time.time()*1000)}_{i}_{uuid.uuid4().hex[:6]}'
+            q.setdefault('subject', 'math')
+            if 'isMulti' not in q:
+                q['isMulti'] = len(q.get('correct', [])) > 1
+        topic = filename.rsplit('.', 1)[0]
+        return jsonify({'topic': topic, 'questions': questions, 'questionsToAsk': len(questions)})
+    except Exception as e:
+        print(f"parse_image error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── KITOBDAN TEST TUZISH (AI generatsiya) ────────────────────────────────
 # Bu yuqoridagi /parse_document'dan TUBDAN farq qiladi: u yerda AI mavjud
 # savollarni MATNDAN TOPADI, bu yerda esa AI oddiy darslik/kitob matnidan
