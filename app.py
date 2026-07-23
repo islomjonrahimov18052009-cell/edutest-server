@@ -96,7 +96,7 @@ def ai_check():
             'https://api.groq.com/openai/v1/chat/completions',
             headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
             json={
-                'model': body.get('model', 'llama-3.3-70b-versatile'),
+                'model': body.get('model', 'openai/gpt-oss-120b'),
                 'messages': messages,
                 'max_tokens': body.get('max_tokens', 1000),
                 'temperature': body.get('temperature', 0.1),
@@ -563,7 +563,7 @@ def parse_text_with_ai(text):
         'https://api.groq.com/openai/v1/chat/completions',
         headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
         json={
-            'model': 'llama-3.3-70b-versatile',
+            'model': 'openai/gpt-oss-120b',
             'messages': [{'role': 'user', 'content': prompt}],
             'max_tokens': 8000,
             'temperature': 0.1,
@@ -850,7 +850,7 @@ def generate_questions_from_content(text_chunk, topic_name, n_questions):
         'https://api.groq.com/openai/v1/chat/completions',
         headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + GROQ_API_KEY},
         json={
-            'model': 'llama-3.3-70b-versatile',
+            'model': 'openai/gpt-oss-120b',
             'messages': [{'role': 'user', 'content': prompt}],
             'max_tokens': 8000,
             'temperature': 0.4,
