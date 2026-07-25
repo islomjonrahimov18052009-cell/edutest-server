@@ -658,7 +658,7 @@ def parse_document():
 # Test sahifasining fotosurati (.jpg/.png) tashlanganda - AI RASMNING OZINI
 # korib, savol/variant/togri javobni aniqlaydi. Togri javob odatda nuqta,
 # doira yoki boshqa belgi bilan korsatiladi - AI shu belgini izlaydi.
-GROQ_VISION_MODEL = os.environ.get('GROQ_VISION_MODEL', 'llama-3.2-90b-vision-preview')
+GROQ_VISION_MODEL = os.environ.get('GROQ_VISION_MODEL', 'qwen/qwen3.6-27b')
 
 @app.route('/parse_image', methods=['POST', 'OPTIONS'])
 def parse_image():
