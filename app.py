@@ -532,7 +532,9 @@ def extract_content_from_file(filename, data):
 def parse_text_with_ai(text):
     if not GROQ_API_KEY:
         raise Exception('AI xizmati sozlanmagan (serverda GROQ_API_KEY yoq)')
-    MAX_CHARS = 40000
+    # MUHIM: Groq bepul tarifida 12000 token/daqiqa (TPM) limiti bor -
+    # kirish (matn) VA chiqish (max_tokens) yigindisiga taalluqli.
+    MAX_CHARS = 20000
     if len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]
     prompt = (
@@ -565,7 +567,7 @@ def parse_text_with_ai(text):
         json={
             'model': 'llama-3.3-70b-versatile',
             'messages': [{'role': 'user', 'content': prompt}],
-            'max_tokens': 8000,
+            'max_tokens': 4000,
             'temperature': 0.1,
             'response_format': {'type': 'json_object'},
         },
@@ -826,16 +828,30 @@ def _split_into_word_chunks(full_text, chunk_words=2500):
 def generate_questions_from_content(text_chunk, topic_name, n_questions):
     if not GROQ_API_KEY:
         raise Exception('AI xizmati sozlanmagan (serverda GROQ_API_KEY yoq)')
-    MAX_CHARS = 12000
+    # MUHIM: Groq bepul tarifida llama-3.3-70b-versatile uchun 12000
+    # token/daqiqa (TPM) limiti bor. Bu limit KIRISH (matn+prompt) VA
+    # CHIQISH (max_tokens) yigindisiga taalluqli. Avval MAX_CHARS=12000 va
+    # max_tokens=8000 birgalikda bu limitdan oshib ketardi (masalan 13053
+    # token so'ralgan, 12000 ruxsat etilgan) - shuning uchun ikkalasi ham
+    # kichraytirilgan.
+    MAX_CHARS = 6000
     if len(text_chunk) > MAX_CHARS:
         text_chunk = text_chunk[:MAX_CHARS]
-    n_questions = max(1, min(int(n_questions or 5), 30))
+    n_questions = max(1, min(int(n_questions or 5), 20))
     prompt = (
         f"Sen tajribali ustozsan. Quyidagi darslik/oquv matni asosida ANIQ {n_questions} ta "
         "test savoli tuz.\n\n"
         "QATIY TALABLAR:\n"
         "- Savollar MURAKKAB va CHUQUR bolishi SHART - oddiy eslab qolish emas, balki "
         "tushunish, taqqoslash, tahlil qilish yoki qollash darajasida bolsin.\n"
+        "- MUHIM - SAVOLLAR TURINI ARALASHTIR, bir xil qolipni takrorlama: "
+        "\"... nima anglatadi?\" yoki \"... nima?\" kabi bitta qolipni HAMMA savolda ishlatish "
+        "QATIYAN TAQIQLANADI. Buning ornida har xil savol turlaridan foydalan, masalan: "
+        "sabab-natija (\"Nega ... sodir boldi?\"), qiyoslash (\"... bilan ... orasidagi asosiy farq "
+        "nimada?\"), xronologiya/tartib (\"... dan keyin nima sodir boldi?\"), qollash "
+        "(\"Agar ... bolsa, natija qanday bolar edi?\"), baholash (\"... ning eng muhim sababi "
+        "nima?\"), togri/notogri tahlil (\"Quyidagilardan qaysi biri togri?\"). Har 5 ta savolning "
+        "kamida 4 tasi BOSHQA-BOSHQA qolipda bolsin.\n"
         "- Har bir savolda ANIQ 4 ta variant, ulardan FAQAT BITTASI togri.\n"
         "- Notogri variantlar (distraktorlar) HAQIQATAN ishonarli va chalgituvchi bolsin - "
         "mavzuga oid, yuzaki qaraganda togriday tuyuladigan tushunchalar bolsin.\n"
@@ -852,7 +868,7 @@ def generate_questions_from_content(text_chunk, topic_name, n_questions):
         json={
             'model': 'llama-3.3-70b-versatile',
             'messages': [{'role': 'user', 'content': prompt}],
-            'max_tokens': 8000,
+            'max_tokens': 4000,
             'temperature': 0.4,
             'response_format': {'type': 'json_object'},
         },
