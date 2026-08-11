@@ -6,3 +6,4 @@ numpy==1.26.4
 requests==2.32.3
 python-docx==1.2.0
 PyMuPDF>=1.23.0,<1.25.0
+pywebpush==2.0.0
