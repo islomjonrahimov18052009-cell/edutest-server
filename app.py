@@ -24,6 +24,15 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://ykpegjtexjwddsfgwwpw.supa
 SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
 DB_KEY = 'edutest_v3'
 
+# ─── PUSH BILDIRISHNOMA (Web Push / VAPID) ────────────────────────────────
+# Ustozga "yangi natija keldi" yoki "o'quvchi internetsiz imtihon topshirdi,
+# internet tiklanganda tekshirish mumkin" kabi xabarlarni brauzer push
+# orqali yuborish uchun. VAPID kalitlar Render Dashboard > Environment'da
+# saqlanishi kerak (bir marta generatsiya qilingan, doim bir xil qoladi).
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
+VAPID_CLAIM_EMAIL = os.environ.get('VAPID_CLAIM_EMAIL', 'mailto:admin@edutest.local')
+
 @app.route('/db_get', methods=['GET', 'OPTIONS'])
 def db_get():
     if request.method == 'OPTIONS':
@@ -78,6 +87,83 @@ def db_save():
     except Exception as e:
         print(f"db_save error: {e}", file=sys.stderr)
         return jsonify({'error': str(e)}), 500
+
+@app.route('/vapid_public_key', methods=['GET'])
+def vapid_public_key():
+    """Frontend push obunasi yaratishda shu ochiq kalitni so'raydi."""
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({'error': 'Server sozlanmagan (VAPID_PUBLIC_KEY yoq)'}), 500
+    return jsonify({'key': VAPID_PUBLIC_KEY})
+
+
+@app.route('/notify_teacher', methods=['POST', 'OPTIONS'])
+def notify_teacher():
+    """Ustozning barcha push obunalariga (bir nechta qurilma bo'lishi
+    mumkin) bildirishnoma yuboradi. Obunalar bazadagi (edutest_v3) JSON
+    ichida db.pushSubs sifatida saqlanadi - frontend ularni saveDB() orqali
+    oddiy ma'lumot kabi Supabase'ga yozadi, bu yerda faqat o'qib, push
+    yuboramiz. Eskirgan/bekor qilingan obunalar (410/404 xato qaytarganlar)
+    javobda "stale" sifatida qaytariladi - frontend keyingi saveDB'da ularni
+    tozalab qo'yadi.
+    """
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+        return jsonify({'error': 'Server sozlanmagan (VAPID kalitlar yoq)'}), 500
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        return jsonify({'error': 'pywebpush ornatilmagan'}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        teacher_id = body.get('teacherId')
+        title = body.get('title', 'EduTest Pro')
+        text = body.get('body', '')
+        url = body.get('url', '/')
+        if not teacher_id:
+            return jsonify({'error': 'teacherId kerak'}), 400
+
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/edutest_store',
+            params={'key': f'eq.{DB_KEY}', 'select': 'value'},
+            headers={'apikey': SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY},
+            timeout=15
+        )
+        if r.status_code >= 400:
+            return jsonify({'error': f'Supabase xato: {r.status_code}'}), 502
+        rows = r.json()
+        if not rows:
+            return jsonify({'sent': 0, 'stale': []})
+        db = json.loads(rows[0]['value'])
+        subs = [s for s in (db.get('pushSubs') or []) if s.get('teacherId') == teacher_id]
+
+        sent, stale = 0, []
+        payload = json.dumps({'title': title, 'body': text, 'url': url})
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info=sub.get('subscription'),
+                    data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={'sub': VAPID_CLAIM_EMAIL},
+                )
+                sent += 1
+            except WebPushException as e:
+                status = getattr(e.response, 'status_code', None)
+                if status in (404, 410):
+                    stale.append(sub.get('subscription', {}).get('endpoint'))
+                print(f"notify_teacher push xato: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"notify_teacher push xato: {e}", file=sys.stderr)
+        return jsonify({'sent': sent, 'total': len(subs), 'stale': stale})
+    except Exception as e:
+        print(f"notify_teacher error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/ai_check', methods=['POST', 'OPTIONS'])
 def ai_check():
@@ -268,11 +354,22 @@ def read_rvf(data, pos, length):
             text = text_part.decode('utf-16-le', errors='replace').strip()
             text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text).strip()
             readable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
-            if len(text) > 2 and readable / max(len(text), 1) > 0.7:
+            # MUHIM: avval bu chegara 0.7 edi - EMF/binary "chiqindi" baytlar
+            # ham UTF-16 sifatida "o'qiladigan" chiqib, xato matn (masalan
+            # "a ‰‰币烈鹵鹵▊2") savolga yozilib qolar edi. Endi ancha qattiqroq:
+            # deyarli barcha belgilar chop etiladigan (0.95+) VA lotin/raqam/
+            # tinish belgilaridan iborat "normal" ulush yetarli (0.85+) bo'lishi
+            # shart - aks holda buni matn deb qabul qilmaymiz.
+            normal_chars = sum(1 for c in text if c.isalnum() or c in " .,+-*/=()[]{}%'\"?!:;\u2116")
+            normal_ratio = normal_chars / max(len(text), 1)
+            if len(text) > 2 and readable / max(len(text), 1) > 0.95 and normal_ratio > 0.85:
                 return text, None
         except: pass
 
-    return None, None
+    # Bu yergacha yetib kelsa - na EMF, na rasm, na ishonchli matn topildi.
+    # Chiqindi belgi qo'yib yubormaymiz - "aniqlanmadi" deb ustozga signal
+    # beramiz, u keyin "✏️ Tahrirlash" orqali qo'lda to'g'rilaydi.
+    return '__UNRECOGNIZED__', None
 
 def extract_questions_raw(xml_text, data):
     """parse_questions bilan bir xil, lekin EMF larni konvertatsiya QILMAYDI -
@@ -313,6 +410,8 @@ def extract_questions_raw(xml_text, data):
                 elif ri:
                     q_text = plain
                     img_b64 = ri
+                elif rt == '__UNRECOGNIZED__':
+                    q_text = plain or "\u26a0\ufe0f (formula aniqlanmadi - qo'lda kiriting)"
                 elif rt:
                     q_text = rt
                 else:
@@ -345,6 +444,8 @@ def extract_questions_raw(xml_text, data):
                     a_text = a_plain or '__IMG_PENDING__'
                 elif a_ri:
                     a_text = a_ri
+                elif a_rt == '__UNRECOGNIZED__':
+                    a_text = a_plain or "\u26a0\ufe0f (aniqlanmadi)"
                 elif a_rt and len(a_rt) > len(a_plain):
                     a_text = a_rt
             if a_text is not None or a_emf:
