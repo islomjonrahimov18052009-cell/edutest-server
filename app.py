@@ -1223,6 +1223,106 @@ def _run_batch_job(job_id, files):
         JOBS[job_id]['error'] = str(e)
 
 
+# ─── TAQSIMLANGAN IMPORT (server-pool, umumiy EMF navbati) ────────────────
+# ESKI USUL: har bir fayl-guruhi BITTA belgilangan serverga to'liq (XML
+# ajratish + EMF konvertatsiya) yuborilar edi - shuning uchun ko'p kichik
+# fayl bolganda ular navbat-navbat, faqat bitta guruh miqdorida parallel
+# ishlanardi.
+#
+# YANGI USUL (2026-08): ikki bosqichga bolinadi -
+#   1) EXTRACT (tez, faqat regex, LibreOffice YOQ) - istalgan BITTA serverda
+#      barcha fayllar XML'dan ochiladi, EMF baytlari (hali PNG'ga
+#      aylanmagan xom EMF) global royxatga chiqariladi.
+#   2) CONVERT (sekin, LibreOffice) - shu global royxat (bitta "umumiy
+#      guruh") frontend tomonidan BARCHA ROYXATDAGI SERVERLARGA
+#      (Oracle VM1-6, Koyeb va h.k.) bir vaqtda, har birining tezligiga
+#      qarab bolib-bolib yuboriladi ("work-stealing"). Har bir server
+#      bu yerdagi /convert_emfs orqali ozining ulushini konvertatsiya
+#      qiladi - qaysi faylga tegishli ekanligini BILISHI SHART EMAS,
+#      faqat xom EMF baytini PNG'ga aylantiradi. Shu sabab bu endpoint
+#      har qanday server turida (hatto zaif Koyeb'da ham) ishlay oladi.
+def _b64_extract_emf_tasks(file_results, file_emf_tasks):
+    """file_emf_tasks (python obyektlar, xom bayt) ni JSON-safe (base64)
+    korinishga otkazadi, hamda har bir EMF vazifasiga GLOBAL noyob id
+    beradi - frontend keyinchalik shu id orqali natijani togri joyga
+    (togri fayl/savol/variantga) qaytarib qoya oladi."""
+    out_tasks = []
+    for fi, tasks in enumerate(file_emf_tasks):
+        for t in tasks:
+            out_tasks.append({
+                'id': f'{fi}_{t["kind"]}_{t["q_idx"]}_{t.get("opt_idx", "")}',
+                'file_index': fi,
+                'emf_b64': base64.b64encode(t['emf']).decode(),
+            })
+    return out_tasks
+
+
+@app.route('/extract_batch_start', methods=['POST', 'OPTIONS'])
+def extract_batch_start():
+    """1-bosqich: fayllarni XML'dan ochadi, EMF baytlarini (KONVERTATSIYA
+    QILMASDAN) global royxat sifatida qaytaradi. Tez ishlaydi (regex),
+    shuning uchun job/polling shart emas - sinxron javob beradi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        files = body.get('files', [])
+        if not files:
+            return jsonify({'error': 'No files'}), 400
+        file_results, file_emf_tasks = _process_files_raw(files)
+        emf_tasks = _b64_extract_emf_tasks(file_results, file_emf_tasks)
+        # Xotira tejash uchun - endi frontend'ga xom EMF baytlarini emas,
+        # faqat FAYL natijalarini (savol matni, variantlar, hali rasmsiz
+        # "bosh joy"lar bilan) va alohida emf_tasks royxatini qaytaramiz.
+        return jsonify({'files': file_results, 'emf_tasks': emf_tasks})
+    except Exception as e:
+        print(f"extract_batch_start error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/convert_emfs', methods=['POST', 'OPTIONS'])
+def convert_emfs():
+    """2-bosqich: UNIVERSAL worker. Qaysi fayl/savolga tegishli ekanini
+    bilmaydi - shunchaki {id, emf_b64} royxatini oladi, {id: png_data_url}
+    qaytaradi. Istalgan server (kuchli yoki zaif) shu endpointni chaqirib,
+    ozi ko'tara oladigan miqdorda ish olishi mumkin - shuning uchun
+    frontend BITTA umumiy EMF navbatini kop turdagi serverlar orasida
+    ularning tezligiga qarab bolib bera oladi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        tasks = body.get('tasks', [])
+        if not tasks:
+            return jsonify({'error': 'No tasks'}), 400
+        # MUHIM: bitta sorovda haddan tashqari kop EMF kelib, zaif server
+        # (masalan Koyeb, 512MB RAM) OOM bolib qolmasligi uchun qattiq
+        # yuqori chegara qoyilgan - frontend har doim kichikroq chunk
+        # yuborishi kerak, lekin server tomonda ham ikkinchi himoya qatlami.
+        MAX_TASKS_PER_REQUEST = 40
+        if len(tasks) > MAX_TASKS_PER_REQUEST:
+            return jsonify({'error': f'Juda kop EMF (max {MAX_TASKS_PER_REQUEST})'}), 400
+        emf_list = []
+        id_map = {}
+        for idx, t in enumerate(tasks):
+            try:
+                emf_bytes = base64.b64decode(t['emf_b64'])
+            except Exception:
+                continue
+            emf_list.append((idx, emf_bytes))
+            id_map[idx] = t['id']
+        results_by_idx = convert_all_emfs(emf_list)
+        results = {id_map[idx]: b64 for idx, b64 in results_by_idx.items() if idx in id_map}
+        return jsonify({'results': results})
+    except Exception as e:
+        print(f"convert_emfs error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/parse_batch_start', methods=['POST', 'OPTIONS'])
 def parse_batch_start():
     if request.method == 'OPTIONS':
