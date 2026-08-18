@@ -1375,3 +1375,204 @@ def _cleanup_stale_jobs():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
+
+# ─── OTA-ONA TELEGRAM BOTI ──────────────────────────────────────────────────
+# Maqsad: ota-ona hech qanday login/parolsiz, bitta Telegram havolasini
+# bosish orqali bolasining haftalik progressini avtomatik oladi. Token
+# HECH QACHON kodda yozilmaydi - faqat Render Environment'da saqlanadi
+# (Dashboard > Environment > TELEGRAM_BOT_TOKEN).
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'EduTestProrobot')
+# Haftalik yuborishni tashqi cron (masalan cron-job.org) chaqiradi -
+# Render'ning bepul tarifida doimiy ishlaydigan fon jarayon (APScheduler)
+# ishonchli emas (server uxlab qolishi mumkin), shuning uchun tashqi
+# "uyg'otuvchi" so'rov + maxfiy kalit orqali himoyalangan endpoint ishlatiladi.
+TG_CRON_SECRET = os.environ.get('TG_CRON_SECRET', '')
+
+def _sb_headers():
+    return {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY,
+        'Content-Type': 'application/json',
+    }
+
+def _load_main_db():
+    """edutest_store ichidagi asosiy JSON blobni service key bilan o'qiydi -
+    db_get bilan bir xil, lekin ichki ishlatish uchun to'g'ridan-to'g'ri
+    dict qaytaradi (JSON string emas)."""
+    r = requests.get(
+        f'{SUPABASE_URL}/rest/v1/edutest_store',
+        params={'key': f'eq.{DB_KEY}', 'select': 'value'},
+        headers=_sb_headers(), timeout=15
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return {}
+    return json.loads(data[0]['value'])
+
+def _tg_send(chat_id, text):
+    if not TELEGRAM_BOT_TOKEN:
+        print("Telegram: TELEGRAM_BOT_TOKEN yoq, xabar yuborilmadi", file=sys.stderr)
+        return False
+    try:
+        r = requests.post(
+            f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage',
+            json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'},
+            timeout=15
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram send xato: {e}", file=sys.stderr)
+        return False
+
+@app.route('/parent_link_create', methods=['POST', 'OPTIONS'])
+def parent_link_create():
+    """Ustoz/o'quvchi 'Ota-onani ulash' tugmasini bosganda chaqiriladi.
+    Bitta bir martalik kod yaratadi va Telegram deep-link qaytaradi -
+    ota-ona shu havolani bosishi bilan bot avtomatik bog'laydi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        student_login = (body.get('student_login') or '').strip()
+        if not student_login:
+            return jsonify({'error': 'student_login kerak'}), 400
+        code = uuid.uuid4().hex[:10]
+        r = requests.post(
+            f'{SUPABASE_URL}/rest/v1/parent_links',
+            headers=_sb_headers(),
+            json={'student_login': student_login, 'link_code': code},
+            timeout=15
+        )
+        if r.status_code >= 400:
+            return jsonify({'error': f'Supabase xato: {r.status_code} {r.text[:200]}'}), 502
+        link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={code}'
+        return jsonify({'link': link, 'code': code})
+    except Exception as e:
+        print(f"parent_link_create xato: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/tg_webhook', methods=['POST'])
+def tg_webhook():
+    """Telegram'dan kelgan har bir update shu yerga tushadi (webhook orqali,
+    polling emas - Render'da doimiy ishlaydigan jarayon shart emas)."""
+    try:
+        update = request.get_json(force=True, silent=True) or {}
+        msg = update.get('message') or {}
+        text = (msg.get('text') or '').strip()
+        chat_id = (msg.get('chat') or {}).get('id')
+        if not chat_id:
+            return jsonify({'ok': True})
+
+        if text.startswith('/start'):
+            parts = text.split(maxsplit=1)
+            code = parts[1].strip() if len(parts) > 1 else ''
+            if not code:
+                _tg_send(chat_id, "Assalomu alaykum! Bu — EduTest Pro ota-ona boti.\n\nBolangizning o'qituvchisidan yoki EduTest Pro ilovasidan olingan shaxsiy havola orqali ulaning.")
+                return jsonify({'ok': True})
+            # Kodni parent_links jadvalida topib, shu chatga bog'laymiz
+            r = requests.get(
+                f'{SUPABASE_URL}/rest/v1/parent_links',
+                params={'link_code': f'eq.{code}', 'select': '*'},
+                headers=_sb_headers(), timeout=15
+            )
+            rows = r.json() if r.status_code < 400 else []
+            if not rows:
+                _tg_send(chat_id, "Kechirasiz, havola topilmadi yoki eskirgan. Iltimos, yangi havola so'rang.")
+                return jsonify({'ok': True})
+            row = rows[0]
+            requests.patch(
+                f'{SUPABASE_URL}/rest/v1/parent_links',
+                params={'id': f'eq.{row["id"]}'},
+                headers=_sb_headers(),
+                json={'telegram_chat_id': str(chat_id), 'linked_at': 'now()'},
+                timeout=15
+            )
+            db = _load_main_db()
+            student = next((u for u in db.get('users', []) if u.get('login') == row['student_login']), None)
+            sname = student['name'] if student else row['student_login']
+            _tg_send(chat_id, f"✅ Muvaffaqiyatli ulandi!\n\n<b>{sname}</b>ning haftalik progressi endi shu yerga avtomatik yuborib turiladi. Hech narsa qilish shart emas.")
+            return jsonify({'ok': True})
+
+        _tg_send(chat_id, "Bu bot faqat avtomatik xabar yuborish uchun ishlatiladi. Savollaringiz bo'lsa, farzandingiz ustoziga murojaat qiling.")
+        return jsonify({'ok': True})
+    except Exception as e:
+        print(f"tg_webhook xato: {e}", file=sys.stderr)
+        return jsonify({'ok': True})  # Telegram'ga har doim 200 qaytaramiz, aks holda qayta-qayta urinaveradi
+
+def _weekly_summary_for_student(db, login):
+    """Bitta o'quvchi uchun so'nggi 7 kunlik natijalar asosida qisqa,
+    ota-ona uchun tushunarli (raqamlarsiz emas, lekin sodda) xabar tuzadi."""
+    import datetime
+    now = datetime.datetime.now()
+    cutoff = now - datetime.timedelta(days=7)
+    student = next((u for u in db.get('users', []) if u.get('login') == login), None)
+    if not student:
+        return None
+    name = student.get('name', login)
+    results = [r for r in db.get('results', []) if r.get('student') == name and r.get('mode') == 'exam']
+
+    def parse_uz_date(s):
+        try:
+            d, m, y = s.split('.')
+            return datetime.datetime(int(y), int(m), int(d))
+        except Exception:
+            return None
+
+    recent = [r for r in results if (parse_uz_date(r.get('date', '')) or now) >= cutoff]
+    if not recent:
+        return f"Salom! Bu hafta <b>{name}</b> hech qanday imtihon topshirmadi. Davomiylik natijalarni yaxshilashning eng muhim omili — bir necha daqiqa ajratishni tavsiya qilamiz."
+
+    topics = sorted(set(r['topic'] for r in recent))
+    avg = round(sum(r['pct'] for r in recent) / len(recent))
+    weakest = min(recent, key=lambda r: r['pct'])
+    lines = [f"📊 <b>{name}</b>ning bu haftalik hisoboti:\n"]
+    lines.append(f"✅ {len(recent)} ta imtihon topshirdi, {len(topics)} ta mavzu bo'yicha")
+    lines.append(f"📈 O'rtacha natija: <b>{avg}%</b>")
+    if weakest['pct'] < 60:
+        lines.append(f"⚠️ Eng qiyin joyi: <b>{weakest['topic']}</b> ({weakest['pct']}%) — shu mavzuni birga takrorlashni tavsiya qilamiz.")
+    else:
+        lines.append("👏 Barcha mavzularda yaxshi natija!")
+    return '\n'.join(lines)
+
+@app.route('/tg_send_weekly', methods=['POST', 'GET'])
+def tg_send_weekly():
+    """Tashqi cron (masalan cron-job.org, haftada 1 marta - yakshanba
+    kechqurun) shu endpointni maxfiy kalit bilan chaqiradi. Bu Render'da
+    doimiy ishlab turadigan scheduler shart emasligini anglatadi."""
+    secret = request.args.get('secret', '')
+    if not TG_CRON_SECRET or secret != TG_CRON_SECRET:
+        return jsonify({'error': 'Ruxsat yoq'}), 403
+    if not SUPABASE_SERVICE_KEY or not TELEGRAM_BOT_TOKEN:
+        return jsonify({'error': 'Server sozlanmagan'}), 500
+    try:
+        db = _load_main_db()
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/parent_links',
+            params={'telegram_chat_id': 'not.is.null', 'select': '*'},
+            headers=_sb_headers(), timeout=15
+        )
+        links = r.json() if r.status_code < 400 else []
+        sent, failed = 0, 0
+        seen_pairs = set()
+        for link in links:
+            key = (link['student_login'], link['telegram_chat_id'])
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            summary = _weekly_summary_for_student(db, link['student_login'])
+            if not summary:
+                continue
+            if _tg_send(link['telegram_chat_id'], summary):
+                sent += 1
+            else:
+                failed += 1
+        return jsonify({'sent': sent, 'failed': failed, 'total_links': len(seen_pairs)})
+    except Exception as e:
+        print(f"tg_send_weekly xato: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
