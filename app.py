@@ -1485,6 +1485,35 @@ def _tg_send_help(chat_id):
     ))
     _tg_send_menu(chat_id)
 
+@app.route('/parent_link_create', methods=['POST', 'OPTIONS'])
+def parent_link_create():
+    """Ustoz/o'quvchi 'Ota-onani ulash' tugmasini bosganda chaqiriladi.
+    Bitta bir martalik kod yaratadi va Telegram deep-link qaytaradi -
+    ota-ona shu havolani bosishi bilan bot avtomatik bog'laydi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        student_login = (body.get('student_login') or '').strip()
+        if not student_login:
+            return jsonify({'error': 'student_login kerak'}), 400
+        code = uuid.uuid4().hex[:10]
+        r = requests.post(
+            f'{SUPABASE_URL}/rest/v1/parent_links',
+            headers=_sb_headers(),
+            json={'student_login': student_login, 'link_code': code},
+            timeout=15
+        )
+        if r.status_code >= 400:
+            return jsonify({'error': f'Supabase xato: {r.status_code} {r.text[:200]}'}), 502
+        link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={code}'
+        return jsonify({'link': link, 'code': code})
+    except Exception as e:
+        print(f"parent_link_create xato: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/tg_webhook', methods=['POST'])
 def tg_webhook():
     """Telegram'dan kelgan har bir update shu yerga tushadi (webhook orqali,
@@ -1672,3 +1701,4 @@ def tg_send_weekly():
     except Exception as e:
         print(f"tg_send_weekly xato: {e}", file=sys.stderr)
         return jsonify({'error': str(e)}), 500
+
