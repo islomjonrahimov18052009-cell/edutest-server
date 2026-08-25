@@ -24,6 +24,116 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://ykpegjtexjwddsfgwwpw.supa
 SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
 DB_KEY = 'edutest_v3'
 
+# ─── CLOUDFLARE R2 (2026-08-25: asosiy malumot + YANGI rasmlar uchun) ─────
+# Supabase bepul tarifi (500MB baza + 1GB storage) kelajakda tor kelishi
+# xavotirlanib, asosiy JSON blob VA yangi importlarda yaratiladigan rasmlar
+# endi R2'ga (10GB bepul, hech qanday chiqish narxi yoq) kochiriladi.
+# MUHIM: eski ~18,456 ta Supabase Storage'dagi rasm KOCHIRILMAYDI - ular
+# ozgarishsiz Supabase'da qoladi va ishlashda davom etadi (ularning URL'lari
+# allaqachon toliq https:// havola, R2'ga kochirish shart emas edi). Faqat
+# BUNDAN KEYINGI yangi rasmlar R2'ga yoziladi.
+# Kalitlar HECH QACHON kodda ochiq yozilmaydi - Render Environment'da
+# saqlanadi (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
+# R2_ENDPOINT_URL, R2_IMAGES_BUCKET, R2_DATA_BUCKET, R2_PUBLIC_URL).
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID', '')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID', '')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY', '')
+R2_ENDPOINT_URL = os.environ.get('R2_ENDPOINT_URL', '')
+R2_IMAGES_BUCKET = os.environ.get('R2_IMAGES_BUCKET', 'edutest-images')
+R2_DATA_BUCKET = os.environ.get('R2_DATA_BUCKET', 'edutest-data')
+R2_PUBLIC_URL = os.environ.get('R2_PUBLIC_URL', '').rstrip('/')
+
+_r2_client_cache = None
+def _r2_client():
+    """R2 uchun S3-mos klient. Agar muhit ozgaruvchilari sozlanmagan bolsa,
+    None qaytaradi - chaqiruvchi funksiyalar shu holatda ESKI (Supabase)
+    yoiga avtomatik qaytadi, hech narsa buzilmaydi."""
+    global _r2_client_cache
+    if _r2_client_cache is not None:
+        return _r2_client_cache
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_ENDPOINT_URL):
+        return False
+    try:
+        import boto3
+        from botocore.config import Config
+        _r2_client_cache = boto3.client(
+            's3',
+            endpoint_url=R2_ENDPOINT_URL,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version='s3v4'),
+            region_name='auto',
+        )
+        return _r2_client_cache
+    except Exception as e:
+        print(f"R2 klient yaratishda xato: {e}", file=sys.stderr)
+        _r2_client_cache = False
+        return False
+
+def r2_upload_image(img_bytes, ext='png'):
+    """PNG/JPEG baytlarni R2 (edutest-images) bucket'iga yuklaydi va PUBLIC
+    URL qaytaradi. Agar R2 sozlanmagan bolsa, ESKI usulga (base64 data URL -
+    keyin brauzer ozi Supabase Storage'ga yuklaydi) zaxira sifatida qaytadi,
+    shunda R2 hali ulanmagan bolsa ham import ishlashda davom etadi."""
+    ext = (ext or 'png').lower()
+    mime = 'image/jpeg' if ext in ('jpg', 'jpeg') else 'image/png'
+    client = _r2_client()
+    if not client or not R2_PUBLIC_URL:
+        return f'data:{mime};base64,' + base64.b64encode(img_bytes).decode()
+    try:
+        key = f'{uuid.uuid4().hex}.{"jpg" if ext in ("jpg","jpeg") else "png"}'
+        client.put_object(Bucket=R2_IMAGES_BUCKET, Key=key, Body=img_bytes, ContentType=mime)
+        return f'{R2_PUBLIC_URL}/{key}'
+    except Exception as e:
+        print(f"R2 rasm yuklashda xato (base64'ga qaytildi): {e}", file=sys.stderr)
+        return f'data:{mime};base64,' + base64.b64encode(img_bytes).decode()
+
+def _r2_data_get(key):
+    client = _r2_client()
+    if not client:
+        return None
+    try:
+        obj = client.get_object(Bucket=R2_DATA_BUCKET, Key=key)
+        return obj['Body'].read()
+    except Exception:
+        return None
+
+def _r2_data_put(key, data_bytes, content_type='application/json'):
+    client = _r2_client()
+    if not client:
+        raise Exception('R2 sozlanmagan (muhit ozgaruvchilari yoq)')
+    client.put_object(Bucket=R2_DATA_BUCKET, Key=key, Body=data_bytes, ContentType=content_type)
+
+def _r2_get_main_db_or_migrate():
+    """Asosiy JSON blobni R2'dan oqiydi. Agar R2'da HALI mavjud bolmasa
+    (birinchi chaqiriq - R2 yangi ulangan), ESKI Supabase'dagi joriy
+    malumotni bir martalik ochirib, R2'ga yozib qoyadi (avtomatik
+    migratsiya) - shundan keyin har doim R2'dan oqiladi. Bu foydalanuvchi
+    tomonidan qolda SQL yoki migratsiya skripti ishga tushirishni talab
+    qilmaydi - butunlay shaffof, birinchi haqiqiy sorov paytida sodir
+    boladi."""
+    data = _r2_data_get(f'{DB_KEY}.json')
+    if data is not None:
+        return data
+    if not SUPABASE_SERVICE_KEY:
+        return None
+    try:
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/edutest_store',
+            params={'key': f'eq.{DB_KEY}', 'select': 'value'},
+            headers={'apikey': SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + SUPABASE_SERVICE_KEY},
+            timeout=15
+        )
+        rows = r.json() if r.status_code < 400 else []
+        if rows and rows[0].get('value'):
+            value = rows[0]['value']
+            _r2_data_put(f'{DB_KEY}.json', value.encode('utf-8'))
+            print("R2 migratsiya: Supabase'dagi asosiy malumot R2'ga muvaffaqiyatli kochirildi", file=sys.stderr)
+            return value.encode('utf-8')
+    except Exception as e:
+        print(f"R2 migratsiya xato (Supabase'dan oqishda): {e}", file=sys.stderr)
+    return None
+
 # ─── PUSH BILDIRISHNOMA (Web Push / VAPID) ────────────────────────────────
 # Ustozga "yangi natija keldi" yoki "o'quvchi internetsiz imtihon topshirdi,
 # internet tiklanganda tekshirish mumkin" kabi xabarlarni brauzer push
@@ -37,6 +147,17 @@ VAPID_CLAIM_EMAIL = os.environ.get('VAPID_CLAIM_EMAIL', 'mailto:admin@edutest.lo
 def db_get():
     if request.method == 'OPTIONS':
         return '', 200
+    # R2 birinchi ustuvorlik - agar sozlangan bolsa, shundan oqiladi
+    # (birinchi chaqiriqda Supabase'dan avtomatik migratsiya qiladi).
+    if _r2_client():
+        try:
+            data = _r2_get_main_db_or_migrate()
+            if data is not None:
+                return jsonify({'value': data.decode('utf-8')})
+            return jsonify({'value': None})
+        except Exception as e:
+            print(f"db_get (R2) xato: {e}", file=sys.stderr)
+            # R2 xatoga uchradi - pastdagi Supabase zaxira yoiga otamiz
     if not SUPABASE_SERVICE_KEY:
         return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
     try:
@@ -63,13 +184,24 @@ def db_get():
 def db_save():
     if request.method == 'OPTIONS':
         return '', 200
-    if not SUPABASE_SERVICE_KEY:
-        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
     try:
         body = request.get_json(force=True, silent=True) or {}
         value = body.get('value')
         if value is None:
             return jsonify({'error': 'No value'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    # R2 birinchi ustuvorlik
+    if _r2_client():
+        try:
+            _r2_data_put(f'{DB_KEY}.json', value.encode('utf-8'))
+            return jsonify({'ok': True})
+        except Exception as e:
+            print(f"db_save (R2) xato: {e}", file=sys.stderr)
+            # R2 xatoga uchradi - pastdagi Supabase zaxira yoiga otamiz
+    if not SUPABASE_SERVICE_KEY:
+        return jsonify({'error': 'Server sozlanmagan (SUPABASE_SERVICE_KEY yoq)'}), 500
+    try:
         r = requests.post(
             f'{SUPABASE_URL}/rest/v1/edutest_store',
             headers={
@@ -273,7 +405,7 @@ def convert_all_emfs(emf_list):
                     print(f"  crop err: {e}", file=sys.stderr)
                     with open(png_path, 'rb') as f:
                         png_bytes = f.read()
-                results[idx] = 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()
+                results[idx] = r2_upload_image(png_bytes, 'png')
                 del png_bytes
             else:
                 print(f"  EMF[{idx}] -> FAILED", file=sys.stderr)
@@ -309,13 +441,13 @@ def read_rvf(data, pos, length):
         end = jpg_data.rfind(b'\xff\xd9')
         if end >= 0: jpg_data = jpg_data[:end+2]
         if len(jpg_data) > 500:
-            return None, 'data:image/jpeg;base64,' + base64.b64encode(jpg_data).decode()
+            return None, r2_upload_image(jpg_data, 'jpg')
 
     png_start = rvf.find(b'\x89PNG\r\n\x1a\n')
     if png_start >= 0:
         png_data = rvf[png_start:]
         if len(png_data) > 500:
-            return None, 'data:image/png;base64,' + base64.b64encode(png_data).decode()
+            return None, r2_upload_image(png_data, 'png')
 
     tmet_pos = rvf.find(b'TMetafile\r\n')
     if tmet_pos >= 0:
@@ -695,17 +827,17 @@ def substitute_image_placeholders(questions, images):
         if ph not in images:
             return s
         img_bytes, ext = images[ph]
-        mime = 'jpeg' if ext.lower() in ('jpg', 'jpeg') else 'png'
+        mime_ext = 'jpg' if ext.lower() in ('jpg', 'jpeg') else 'png'
         try:
             from PIL import Image
             im = Image.open(io.BytesIO(img_bytes)).convert('RGB')
             buf = io.BytesIO()
             im.save(buf, format='PNG', optimize=True)
             img_bytes = buf.getvalue()
-            mime = 'png'
+            mime_ext = 'png'
         except Exception:
             pass
-        return f'data:image/{mime};base64,' + base64.b64encode(img_bytes).decode()
+        return r2_upload_image(img_bytes, mime_ext)
 
     for q in questions:
         qtext = (q.get('text') or '').strip()
