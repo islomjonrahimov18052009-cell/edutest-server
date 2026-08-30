@@ -1515,6 +1515,71 @@ if __name__ == '__main__':
 # HECH QACHON kodda yozilmaydi - faqat Render Environment'da saqlanadi
 # (Dashboard > Environment > TELEGRAM_BOT_TOKEN).
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+
+# ─── EMAIL (2026-08-29: ustoz royxatdan otish/tasdiqlash xabarlari uchun) ──
+# Gmail SMTP orqali ishlaydi (App Password bilan - oddiy Gmail parol EMAS,
+# Google hisobida "App passwords" bolimidan 16 xonali maxsus parol olinadi).
+# Kalitlar Render Environment'da: EMAIL_SMTP_USER (Gmail manzil),
+# EMAIL_SMTP_PASS (16 xonali App Password).
+EMAIL_SMTP_USER = os.environ.get('EMAIL_SMTP_USER', '')
+EMAIL_SMTP_PASS = os.environ.get('EMAIL_SMTP_PASS', '')
+
+def _send_email(to_email, subject, body_html):
+    if not (EMAIL_SMTP_USER and EMAIL_SMTP_PASS):
+        print("Email: EMAIL_SMTP_USER/EMAIL_SMTP_PASS yoq, xabar yuborilmadi", file=sys.stderr)
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f'EduTest Pro <{EMAIL_SMTP_USER}>'
+        msg['To'] = to_email
+        msg.attach(MIMEText(body_html, 'html'))
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=15) as server:
+            server.login(EMAIL_SMTP_USER, EMAIL_SMTP_PASS)
+            server.sendmail(EMAIL_SMTP_USER, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"Email yuborishda xato: {e}", file=sys.stderr)
+        return False
+
+@app.route('/notify_teacher_status', methods=['POST', 'OPTIONS'])
+def notify_teacher_status():
+    """Admin ustozni tasdiqlagan yoki rad etganda chaqiriladi - ustozning
+    ro'yxatdan o'tishda ko'rsatgan emailiga avtomatik xabar yuboradi."""
+    if request.method == 'OPTIONS':
+        return '', 200
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        to_email = (body.get('email') or '').strip()
+        name = (body.get('name') or '').strip()
+        login = (body.get('login') or '').strip()
+        status = (body.get('status') or '').strip()
+        if not to_email or status not in ('approved', 'blocked'):
+            return jsonify({'error': 'email va togri status (approved/blocked) kerak'}), 400
+        if status == 'approved':
+            subject = 'EduTest Pro - Hisobingiz tasdiqlandi'
+            body_html = (
+                f"<p>Assalomu alaykum, <b>{name}</b>!</p>"
+                f"<p>Sizning EduTest Pro'dagi so'rovingiz <b>tasdiqlandi</b>. Endi tizimga kirishingiz mumkin.</p>"
+                f"<p>Login: <b>{login}</b></p>"
+                f"<p>Ro'yxatdan o'tishda kiritgan parolingiz bilan kiring.</p>"
+            )
+        else:
+            subject = 'EduTest Pro - So\'rovingiz haqida'
+            body_html = (
+                f"<p>Assalomu alaykum, <b>{name}</b>!</p>"
+                f"<p>Afsuski, sizning EduTest Pro'dagi ustoz sifatida ro'yxatdan o'tish so'rovingiz "
+                f"admin tomonidan <b>rad etildi</b>.</p>"
+                f"<p>Savollaringiz bo'lsa, maktab administratsiyasi bilan bog'laning.</p>"
+            )
+        ok = _send_email(to_email, subject, body_html)
+        return jsonify({'sent': ok})
+    except Exception as e:
+        print(f"notify_teacher_status xato: {e}", file=sys.stderr)
+        return jsonify({'error': str(e)}), 500
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'EduTestProrobot')
 # Haftalik yuborishni tashqi cron (masalan cron-job.org) chaqiradi -
 # Render'ning bepul tarifida doimiy ishlaydigan fon jarayon (APScheduler)
